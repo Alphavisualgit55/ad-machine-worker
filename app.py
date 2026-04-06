@@ -5,34 +5,25 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# Garder le health check rapide même pendant le traitement
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({'name': 'Ad Machine Worker', 'status': 'running'})
 
 @app.route('/health', methods=['GET'])
 def health():
-    # Réponse INSTANTANÉE - jamais bloquée
     return jsonify({'status': 'ok', 'ffmpeg': 'ok'})
 
 class SB:
     def __init__(self, url, key):
         self.url = url.rstrip('/')
-        self.h = {
-            'apikey': key,
-            'Authorization': f'Bearer {key}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=representation',
-        }
+        self.h = {'apikey': key, 'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', 'Prefer': 'return=representation'}
 
     def update_project(self, pid, data):
-        try:
-            requests.patch(f"{self.url}/rest/v1/projects?id=eq.{pid}", headers=self.h, json=data, timeout=30)
+        try: requests.patch(f"{self.url}/rest/v1/projects?id=eq.{pid}", headers=self.h, json=data, timeout=30)
         except: pass
 
     def update_video(self, pid, data):
-        try:
-            requests.patch(f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.true", headers=self.h, json=data, timeout=30)
+        try: requests.patch(f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.true", headers=self.h, json=data, timeout=30)
         except: pass
 
     def get_sources(self, pid):
@@ -54,38 +45,35 @@ class SB:
 @app.route('/render', methods=['POST'])
 def render():
     data = request.json
-    pid          = data.get('projectId')
-    video_urls   = data.get('videoUrls', [])
-    voice_url    = data.get('voiceUrl')
-    music_url    = data.get('musicUrl')
-    voiceover    = data.get('voiceover', '')
-    duration     = int(data.get('duration', 30))
-    style        = data.get('captionStyle', 'bold')
-    sb_url       = data.get('supabaseUrl')
-    sb_key       = data.get('supabaseKey')
+    pid        = data.get('projectId')
+    video_urls = data.get('videoUrls', [])
+    voice_url  = data.get('voiceUrl')
+    music_url  = data.get('musicUrl')
+    voiceover  = data.get('voiceover', '')
+    duration   = int(data.get('duration', 30))
+    style      = data.get('captionStyle', 'bold')
+    sb_url     = data.get('supabaseUrl')
+    sb_key     = data.get('supabaseKey')
 
     if not pid or not video_urls:
         return jsonify({'error': 'Données manquantes'}), 400
 
-    # Répondre IMMÉDIATEMENT - traitement en background thread
     def run():
         sb = SB(sb_url, sb_key)
         try:
             url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb)
-            print(f"[{pid}] ✅ DONE: {url[:60]}")
+            print(f"[{pid}] ✅ DONE")
         except Exception as e:
             traceback.print_exc()
             print(f"[{pid}] ❌ ERROR: {e}")
             try:
                 srcs = sb.get_sources(pid)
-                if srcs:
-                    sb.update_video(pid, {'video_url': srcs[0]['video_url']})
+                if srcs: sb.update_video(pid, {'video_url': srcs[0]['video_url']})
                 sb.update_project(pid, {'status': 'done'})
             except: pass
 
     threading.Thread(target=run, daemon=True).start()
-    # Réponse immédiate avant même de commencer le traitement
-    return jsonify({'success': True, 'message': 'Traitement lancé en background'})
+    return jsonify({'success': True})
 
 
 def dl(url, path):
@@ -112,51 +100,49 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{pid}] START {duration}s {len(video_urls)} videos")
 
-        import concurrent.futures
-
-        # 1. TÉLÉCHARGER EN PARALLÈLE
-        def dl_vid(args):
-            i, url = args
+        # 1. TÉLÉCHARGER UNE PAR UNE (économise RAM)
+        sources = []
+        for i, url in enumerate(video_urls[:6]):  # Max 6 vidéos
             p = f"{tmp}/src_{i}.mp4"
-            try: dl(url, p); return p
-            except Exception as e: print(f"  dl error {i}: {e}"); return None
+            try:
+                dl(url, p)
+                sources.append(p)
+                print(f"  video {i+1} downloaded")
+            except Exception as e:
+                print(f"  dl error {i}: {e}")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-            sources = list(filter(None, ex.map(dl_vid, enumerate(video_urls[:10]))))
-
-        print(f"  {len(sources)} videos downloaded")
         if not sources: raise Exception("No videos downloaded")
 
-        # 2. EXTRAIRE CLIPS 3S EN PARALLÈLE
-        def extract(args):
-            src, base = args
-            clips = []
+        # 2. EXTRAIRE CLIPS 3S - UNE VIDÉO À LA FOIS (économise RAM)
+        all_clips = []
+        clips_needed = math.ceil(duration / 3.0) + 2
+
+        for src_idx, src in enumerate(sources):
+            if len(all_clips) >= clips_needed: break
             try:
-                d = get_dur(src); start = 0.0; idx = base
-                while start + 1.5 <= d:
-                    out = f"{tmp}/c_{idx:04d}.mp4"; cd = min(3.0, d - start)
+                src_dur = get_dur(src)
+                start = 0.0; idx = src_idx * 50
+                while start + 1.5 <= src_dur and len(all_clips) < clips_needed:
+                    out = f"{tmp}/c_{idx:04d}.mp4"
+                    cd = min(3.0, src_dur - start)
                     r = subprocess.run([
                         'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
                         '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                        '-r', '30', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-an', out
+                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                        '-an', out
                     ], capture_output=True)
-                    if r.returncode == 0: clips.append(out)
+                    if r.returncode == 0:
+                        all_clips.append(out)
+                        print(f"  clip {len(all_clips)} extracted")
                     idx += 1; start += 3.0
-            except Exception as e: print(f"  extract error: {e}")
-            return clips
+            except Exception as e:
+                print(f"  extract error: {e}")
 
-        all_clips = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            for clips in ex.map(extract, [(s, i*100) for i, s in enumerate(sources)]):
-                all_clips.extend(clips)
-
-        all_clips.sort()
-        print(f"  {len(all_clips)} clips extracted")
-        if not all_clips: raise Exception("No clips extracted")
-
-        for s in sources:
-            try: os.remove(s)
+            # Supprimer la source après extraction pour libérer RAM
+            try: os.remove(src)
             except: pass
+
+        if not all_clips: raise Exception("No clips extracted")
 
         # 3. ASSEMBLER
         needed = math.ceil(duration / 3.0)
@@ -169,36 +155,29 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         assembled = f"{tmp}/assembled.mp4"
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
-            '-t', str(duration), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-r', '30', assembled
+            '-t', str(duration), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-r', '30',
+            assembled
         ], check=True, capture_output=True)
-        print(f"  {len(selected)} clips assembled")
+        print(f"  assembled OK")
 
+        # Libérer les clips
         for c in all_clips:
             try: os.remove(c)
             except: pass
 
-        # 4. VOIX + MUSIQUE EN PARALLÈLE
+        # 4. VOIX + MUSIQUE
         voice_path = music_path = None
-
-        def dl_voice():
-            nonlocal voice_path
-            if not voice_url: return
+        if voice_url:
             try:
                 p = f"{tmp}/voice.mp3"; dl(voice_url, p); voice_path = p
                 print("  voice OK")
             except Exception as e: print(f"  voice error: {e}")
 
-        def dl_music():
-            nonlocal music_path
-            if not music_url: return
+        if music_url:
             try:
                 p = f"{tmp}/music.mp3"; dl(music_url, p); music_path = p
                 print("  music OK")
             except Exception as e: print(f"  music error: {e}")
-
-        t1 = threading.Thread(target=dl_voice)
-        t2 = threading.Thread(target=dl_music)
-        t1.start(); t2.start(); t1.join(); t2.join()
 
         # 5. CAPTIONS
         srt = f"{tmp}/captions.srt"
@@ -220,7 +199,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
             f"Shadow={st['shadow']},Bold={st['bold']},Alignment=2,MarginV=260'"
         )
 
-        # 6. MONTAGE FINAL
+        # 6. RENDU FINAL
         output = f"{tmp}/final.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
         n = 1
@@ -241,17 +220,21 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                     f'[v][m]amix=inputs=2:duration=first[a]',
                     '-map', '0:v', '-map', '[a]']
 
-        cmd += ['-t', str(duration), '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        cmd += ['-t', str(duration), '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
                 '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-r', '30', output]
 
         print("  Rendering...")
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=500)
         if res.returncode != 0:
-            print("FFmpeg stderr:", res.stderr[-2000:])
-            raise Exception(f"FFmpeg failed: {res.stderr[-300:]}")
+            print("FFmpeg error:", res.stderr[-2000:])
+            raise Exception(f"FFmpeg: {res.stderr[-300:]}")
 
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"  Render OK ({size_mb:.1f}MB)")
+
+        # Supprimer assembled pour libérer RAM avant upload
+        try: os.remove(assembled)
+        except: pass
 
         # 7. UPLOAD
         filename = f"renders/{pid}/final.mp4"
