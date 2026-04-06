@@ -5,9 +5,62 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-def get_supabase(url, key):
-    from supabase import create_client
-    return create_client(url, key)
+# ===== SUPABASE VIA API REST DIRECTE (pas de SDK) =====
+class SupabaseClient:
+    def __init__(self, url, key):
+        self.url = url.rstrip('/')
+        self.key = key
+        self.headers = {
+            'apikey': key,
+            'Authorization': f'Bearer {key}',
+            'Content-Type': 'application/json',
+            'Prefer': 'return=representation',
+        }
+
+    def update_project(self, project_id, data):
+        r = requests.patch(
+            f"{self.url}/rest/v1/projects?id=eq.{project_id}",
+            headers=self.headers, json=data, timeout=30
+        )
+        return r.status_code < 300
+
+    def update_video(self, project_id, data):
+        r = requests.patch(
+            f"{self.url}/rest/v1/videos?project_id=eq.{project_id}&generated=eq.true",
+            headers=self.headers, json=data, timeout=30
+        )
+        return r.status_code < 300
+
+    def get_source_videos(self, project_id):
+        r = requests.get(
+            f"{self.url}/rest/v1/videos?project_id=eq.{project_id}&generated=eq.false&select=*",
+            headers=self.headers, timeout=30
+        )
+        return r.json() if r.status_code < 300 else []
+
+    def insert_video(self, data):
+        r = requests.post(
+            f"{self.url}/rest/v1/videos",
+            headers=self.headers, json=data, timeout=30
+        )
+        return r.status_code < 300
+
+    def upload_file(self, bucket, path, data, content_type='video/mp4'):
+        headers = {
+            'apikey': self.key,
+            'Authorization': f'Bearer {self.key}',
+            'Content-Type': content_type,
+            'x-upsert': 'true',
+        }
+        r = requests.post(
+            f"{self.url}/storage/v1/object/{bucket}/{path}",
+            headers=headers, data=data, timeout=300
+        )
+        return r.status_code < 300
+
+    def get_public_url(self, bucket, path):
+        return f"{self.url}/storage/v1/object/public/{bucket}/{path}"
+
 
 @app.route('/', methods=['GET'])
 def index():
@@ -38,25 +91,21 @@ def render():
         return jsonify({'error': 'Données manquantes'}), 400
 
     def run():
+        sb = SupabaseClient(sb_url, sb_key)
         try:
-            url = process_video(project_id, video_urls, voice_url, music_url,
-                               voiceover, duration, caption_style, sb_url, sb_key)
-            print(f"[{project_id}] DONE: {url[:80]}")
+            url = process_video(
+                project_id, video_urls, voice_url, music_url,
+                voiceover, duration, caption_style, sb
+            )
+            print(f"[{project_id}] ✅ DONE: {url[:80]}")
         except Exception as e:
             traceback.print_exc()
-            print(f"[{project_id}] ERROR: {e}")
+            print(f"[{project_id}] ❌ ERROR: {e}")
             try:
-                sb = get_supabase(sb_url, sb_key)
-                vids = sb.table('videos').select('*') \
-                    .eq('project_id', project_id).eq('generated', False).execute()
-                if vids.data:
-                    sb.table('videos').insert({
-                        'project_id': project_id,
-                        'video_url': vids.data[0]['video_url'],
-                        'generated': True
-                    }).execute()
-                sb.table('projects').update({'status': 'done'}) \
-                    .eq('id', project_id).execute()
+                src_vids = sb.get_source_videos(project_id)
+                if src_vids:
+                    sb.update_video(project_id, {'video_url': src_vids[0]['video_url']})
+                sb.update_project(project_id, {'status': 'done'})
             except Exception as e2:
                 print(f"Fallback error: {e2}")
 
@@ -89,29 +138,25 @@ def make_srt(words, total_dur, path):
             f.write(f"{i+1}\n{ts(i*tpw)} --> {ts(min((i+1)*tpw,total_dur))}\n{w.upper()}\n\n")
 
 def process_video(project_id, video_urls, voice_url, music_url,
-                  voiceover, duration, caption_style, sb_url, sb_key):
+                  voiceover, duration, caption_style, sb):
 
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{project_id}] START {duration}s {len(video_urls)} videos")
 
-        # 1. TÉLÉCHARGER VIDÉOS EN PARALLÈLE
+        # 1. TÉLÉCHARGER EN PARALLÈLE
         import concurrent.futures
+
         def dl_video(args):
             i, url = args
             p = f"{tmp}/src_{i}.mp4"
-            try:
-                dl(url, p)
-                return p
-            except Exception as e:
-                print(f"  dl error {i}: {e}")
-                return None
+            try: dl(url, p); return p
+            except Exception as e: print(f"  dl error {i}: {e}"); return None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
             sources = list(filter(None, ex.map(dl_video, enumerate(video_urls[:10]))))
 
         print(f"  {len(sources)} videos downloaded")
-        if not sources:
-            raise Exception("No videos downloaded")
+        if not sources: raise Exception("No videos downloaded")
 
         # 2. EXTRAIRE CLIPS 3S EN PARALLÈLE
         def extract(args):
@@ -119,8 +164,7 @@ def process_video(project_id, video_urls, voice_url, music_url,
             clips = []
             try:
                 src_dur = get_dur(src)
-                start = 0.0
-                idx = base_idx
+                start = 0.0; idx = base_idx
                 while start + 1.5 <= src_dur:
                     out = f"{tmp}/c_{idx:04d}.mp4"
                     cd = min(3.0, src_dur - start)
@@ -129,12 +173,9 @@ def process_video(project_id, video_urls, voice_url, music_url,
                         '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
                         '-r', '30', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-an', out
                     ], capture_output=True)
-                    if r.returncode == 0:
-                        clips.append(out)
-                    idx += 1
-                    start += 3.0
-            except Exception as e:
-                print(f"  extract error: {e}")
+                    if r.returncode == 0: clips.append(out)
+                    idx += 1; start += 3.0
+            except Exception as e: print(f"  extract error: {e}")
             return clips
 
         all_clips = []
@@ -144,10 +185,8 @@ def process_video(project_id, video_urls, voice_url, music_url,
 
         all_clips.sort()
         print(f"  {len(all_clips)} clips extracted")
-        if not all_clips:
-            raise Exception("No clips extracted")
+        if not all_clips: raise Exception("No clips extracted")
 
-        # Libérer les sources
         for s in sources:
             try: os.remove(s)
             except: pass
@@ -164,8 +203,7 @@ def process_video(project_id, video_urls, voice_url, music_url,
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
             '-i', concat, '-t', str(duration),
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-r', '30',
-            assembled
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-r', '30', assembled
         ], check=True, capture_output=True)
         print(f"  {len(selected)} clips assembled")
 
@@ -175,13 +213,12 @@ def process_video(project_id, video_urls, voice_url, music_url,
 
         # 4. VOIX + MUSIQUE EN PARALLÈLE
         voice_path = music_path = None
+
         def dl_voice():
             nonlocal voice_path
             if not voice_url: return
             try:
-                p = f"{tmp}/voice.mp3"
-                dl(voice_url, p)
-                voice_path = p
+                p = f"{tmp}/voice.mp3"; dl(voice_url, p); voice_path = p
                 print("  voice OK")
             except Exception as e: print(f"  voice error: {e}")
 
@@ -189,24 +226,20 @@ def process_video(project_id, video_urls, voice_url, music_url,
             nonlocal music_path
             if not music_url: return
             try:
-                p = f"{tmp}/music.mp3"
-                dl(music_url, p)
-                music_path = p
+                p = f"{tmp}/music.mp3"; dl(music_url, p); music_path = p
                 print("  music OK")
             except Exception as e: print(f"  music error: {e}")
 
         t1 = threading.Thread(target=dl_voice)
         t2 = threading.Thread(target=dl_music)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        t1.start(); t2.start(); t1.join(); t2.join()
 
         # 5. CAPTIONS SRT
         srt = f"{tmp}/captions.srt"
         words = [w for w in voiceover.replace('\n', ' ').split() if w]
         make_srt(words, duration, srt)
-        print(f"  {len(words)} words in captions")
+        print(f"  {len(words)} words")
 
-        # Style — utiliser polices Liberation disponibles sur Debian
         styles = {
             'bold':       {'size': 85, 'color': '&H00FFFFFF', 'oc': '&H00000000', 'outline': 7, 'bold': 1, 'shadow': 3},
             'minimal':    {'size': 70, 'color': '&H00FFFFFF', 'oc': '&H00000000', 'outline': 2, 'bold': 0, 'shadow': 1},
@@ -214,15 +247,11 @@ def process_video(project_id, video_urls, voice_url, music_url,
         }
         st = styles.get(caption_style, styles['bold'])
         srt_esc = srt.replace(':', '\\:')
-
         srt_filter = (
             f"subtitles={srt_esc}:force_style='"
-            f"FontSize={st['size']},"
-            f"PrimaryColour={st['color']},"
-            f"OutlineColour={st['oc']},"
-            f"BorderStyle=1,Outline={st['outline']},"
-            f"Shadow={st['shadow']},"
-            f"Bold={st['bold']},Alignment=2,MarginV=260'"
+            f"FontSize={st['size']},PrimaryColour={st['color']},"
+            f"OutlineColour={st['oc']},BorderStyle=1,Outline={st['outline']},"
+            f"Shadow={st['shadow']},Bold={st['bold']},Alignment=2,MarginV=260'"
         )
 
         # 6. MONTAGE FINAL
@@ -256,30 +285,21 @@ def process_video(project_id, video_urls, voice_url, music_url,
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=500)
         if res.returncode != 0:
             print("FFmpeg error:", res.stderr[-2000:])
-            raise Exception(f"FFmpeg failed: {res.stderr[-300:]}")
+            raise Exception(f"FFmpeg: {res.stderr[-300:]}")
 
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"  Render OK ({size_mb:.1f}MB)")
 
-        # 7. UPLOAD SUPABASE
-        sb = get_supabase(sb_url, sb_key)
+        # 7. UPLOAD VIA API REST SUPABASE
         filename = f"renders/{project_id}/final.mp4"
-
         with open(output, 'rb') as f:
             video_bytes = f.read()
 
-        sb.storage.from_('videos').upload(
-            filename, video_bytes,
-            {'content-type': 'video/mp4', 'upsert': 'true'}
-        )
+        sb.upload_file('videos', filename, video_bytes)
+        public_url = sb.get_public_url('videos', filename)
 
-        url_res = sb.storage.from_('videos').get_public_url(filename)
-        public_url = url_res if isinstance(url_res, str) else url_res.get('publicUrl', '')
-
-        sb.table('videos').update({'video_url': public_url}) \
-            .eq('project_id', project_id).eq('generated', True).execute()
-        sb.table('projects').update({'status': 'done'}) \
-            .eq('id', project_id).execute()
+        sb.update_video(project_id, {'video_url': public_url})
+        sb.update_project(project_id, {'status': 'done'})
 
         print(f"  Upload OK")
         return public_url
