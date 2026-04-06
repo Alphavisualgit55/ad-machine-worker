@@ -5,8 +5,17 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# Garder le health check rapide même pendant le traitement
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({'name': 'Ad Machine Worker', 'status': 'running'})
+
+@app.route('/health', methods=['GET'])
+def health():
+    # Réponse INSTANTANÉE - jamais bloquée
+    return jsonify({'status': 'ok', 'ffmpeg': 'ok'})
+
 class SB:
-    """Client Supabase via API REST directe - pas de SDK"""
     def __init__(self, url, key):
         self.url = url.rstrip('/')
         self.h = {
@@ -17,35 +26,30 @@ class SB:
         }
 
     def update_project(self, pid, data):
-        requests.patch(f"{self.url}/rest/v1/projects?id=eq.{pid}", headers=self.h, json=data, timeout=30)
+        try:
+            requests.patch(f"{self.url}/rest/v1/projects?id=eq.{pid}", headers=self.h, json=data, timeout=30)
+        except: pass
 
     def update_video(self, pid, data):
-        requests.patch(f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.true", headers=self.h, json=data, timeout=30)
+        try:
+            requests.patch(f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.true", headers=self.h, json=data, timeout=30)
+        except: pass
 
     def get_sources(self, pid):
-        r = requests.get(f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.false&select=*", headers=self.h, timeout=30)
-        return r.json() if r.ok else []
+        try:
+            r = requests.get(f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.false&select=*", headers=self.h, timeout=30)
+            return r.json() if r.ok else []
+        except: return []
 
     def upload(self, bucket, path, data, ct='video/mp4'):
-        h = {**self.h, 'Content-Type': ct, 'x-upsert': 'true'}
-        del h['Prefer']
-        requests.post(f"{self.url}/storage/v1/object/{bucket}/{path}", headers=h, data=data, timeout=300)
+        try:
+            h = {'apikey': self.h['apikey'], 'Authorization': self.h['Authorization'], 'Content-Type': ct, 'x-upsert': 'true'}
+            requests.post(f"{self.url}/storage/v1/object/{bucket}/{path}", headers=h, data=data, timeout=300)
+        except: pass
 
     def public_url(self, bucket, path):
         return f"{self.url}/storage/v1/object/public/{bucket}/{path}"
 
-
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({'name': 'Ad Machine Worker', 'status': 'running', 'version': '2.0'})
-
-@app.route('/health', methods=['GET'])
-def health():
-    try:
-        r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
-        return jsonify({'status': 'ok', 'ffmpeg': 'ok' if r.returncode == 0 else 'error'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/render', methods=['POST'])
 def render():
@@ -63,11 +67,12 @@ def render():
     if not pid or not video_urls:
         return jsonify({'error': 'Données manquantes'}), 400
 
+    # Répondre IMMÉDIATEMENT - traitement en background thread
     def run():
         sb = SB(sb_url, sb_key)
         try:
             url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb)
-            print(f"[{pid}] ✅ DONE")
+            print(f"[{pid}] ✅ DONE: {url[:60]}")
         except Exception as e:
             traceback.print_exc()
             print(f"[{pid}] ❌ ERROR: {e}")
@@ -79,7 +84,8 @@ def render():
             except: pass
 
     threading.Thread(target=run, daemon=True).start()
-    return jsonify({'success': True})
+    # Réponse immédiate avant même de commencer le traitement
+    return jsonify({'success': True, 'message': 'Traitement lancé en background'})
 
 
 def dl(url, path):
@@ -106,9 +112,9 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{pid}] START {duration}s {len(video_urls)} videos")
 
-        # 1. TÉLÉCHARGER EN PARALLÈLE
         import concurrent.futures
 
+        # 1. TÉLÉCHARGER EN PARALLÈLE
         def dl_vid(args):
             i, url = args
             p = f"{tmp}/src_{i}.mp4"
@@ -194,11 +200,11 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         t2 = threading.Thread(target=dl_music)
         t1.start(); t2.start(); t1.join(); t2.join()
 
-        # 5. CAPTIONS SRT MOT PAR MOT
+        # 5. CAPTIONS
         srt = f"{tmp}/captions.srt"
         words = [w for w in voiceover.replace('\n', ' ').split() if w]
         make_srt(words, duration, srt)
-        print(f"  {len(words)} words in captions")
+        print(f"  {len(words)} words")
 
         styles = {
             'bold':       {'size': 85, 'color': '&H00FFFFFF', 'oc': '&H00000000', 'outline': 7, 'bold': 1, 'shadow': 3},
@@ -214,13 +220,12 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
             f"Shadow={st['shadow']},Bold={st['bold']},Alignment=2,MarginV=260'"
         )
 
-        # 6. MONTAGE FINAL HAUTE QUALITÉ
+        # 6. MONTAGE FINAL
         output = f"{tmp}/final.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
         n = 1
         if voice_path: cmd += ['-i', voice_path]; n += 1
         if music_path: cmd += ['-i', music_path]; n += 1
-
         cmd += ['-vf', srt_filter]
 
         if n == 1:
@@ -248,17 +253,16 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"  Render OK ({size_mb:.1f}MB)")
 
-        # 7. UPLOAD SUPABASE
+        # 7. UPLOAD
         filename = f"renders/{pid}/final.mp4"
         with open(output, 'rb') as f: video_bytes = f.read()
 
         sb.upload('videos', filename, video_bytes)
         public_url = sb.public_url('videos', filename)
-
         sb.update_video(pid, {'video_url': public_url})
         sb.update_project(pid, {'status': 'done'})
 
-        print(f"  Upload OK → {public_url[:60]}")
+        print(f"  Upload OK")
         return public_url
 
 

@@ -12,4 +12,6 @@ RUN pip install --no-cache-dir -q -r requirements.txt
 COPY app.py .
 
 EXPOSE 8000
-CMD gunicorn --bind "0.0.0.0:${PORT:-8000}" --timeout 600 --workers 1 --threads 8 app:app
+
+# threads=8 permet au health check de répondre même pendant FFmpeg
+CMD gunicorn --bind "0.0.0.0:${PORT:-8000}" --timeout 600 --workers 1 --threads 8 --worker-class gthread app:app
