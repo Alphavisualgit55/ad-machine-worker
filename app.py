@@ -34,16 +34,16 @@ def render():
     if not project_id or not video_urls:
         return jsonify({'error': 'Données manquantes'}), 400
 
-    # Lancer en thread pour éviter le timeout HTTP
     def run():
         try:
             url = process_video(
                 project_id, video_urls, voice_url, music_url,
                 voiceover, duration, caption_style, sb_url, sb_key
             )
-            print(f"[{project_id}] Terminé: {url}")
+            print(f"[{project_id}] ✅ Terminé: {url}")
         except Exception as e:
             traceback.print_exc()
+            print(f"[{project_id}] ❌ Erreur: {e}")
             try:
                 sb = create_client(sb_url, sb_key)
                 vids = sb.table('videos').select('*') \
@@ -58,18 +58,30 @@ def render():
                     .eq('id', project_id).execute()
             except: pass
 
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-
-    # Répondre immédiatement — le traitement continue en background
+    threading.Thread(target=run, daemon=True).start()
     return jsonify({'success': True, 'message': 'Traitement en cours'})
 
-def download(url, path):
-    r = requests.get(url, stream=True, timeout=120)
-    r.raise_for_status()
-    with open(path, 'wb') as f:
-        for chunk in r.iter_content(8192):
-            f.write(chunk)
+def download_parallel(url_path_pairs):
+    """Télécharger plusieurs fichiers en parallèle"""
+    import concurrent.futures
+    def dl(args):
+        url, path = args
+        r = requests.get(url, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(path, 'wb') as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+        return path
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(dl, pair): pair for pair in url_path_pairs}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                print(f"  Download error: {e}")
+    return results
 
 def get_duration(path):
     r = subprocess.run(
@@ -77,6 +89,40 @@ def get_duration(path):
         capture_output=True, text=True
     )
     return float(json.loads(r.stdout)['format']['duration'])
+
+def extract_clips_parallel(src, tmp, start_idx, clip_dur=3.0):
+    """Extraire tous les clips d'une vidéo source"""
+    try:
+        src_dur = get_duration(src)
+    except:
+        return []
+
+    clips = []
+    start = 0.0
+    idx = start_idx
+
+    while start + 1.5 <= src_dur:
+        clip_path = f"{tmp}/clip_{idx:03d}.mp4"
+        cd = min(clip_dur, src_dur - start)
+
+        result = subprocess.run([
+            'ffmpeg', '-y',
+            '-ss', str(start), '-i', src,
+            '-t', str(cd),
+            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
+            '-r', '30',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',  # Plus rapide que ultrafast mais meilleure qualité
+            '-crf', '20',           # Haute qualité
+            '-an', clip_path
+        ], capture_output=True)
+
+        if result.returncode == 0:
+            clips.append(clip_path)
+            idx += 1
+        start += clip_dur
+
+    return clips
 
 def make_srt(words, total_duration, path):
     if not words: return
@@ -95,55 +141,42 @@ def process_video(project_id, video_urls, voice_url, music_url,
                   voiceover, duration, caption_style, sb_url, sb_key):
 
     with tempfile.TemporaryDirectory() as tmp:
-        print(f"[{project_id}] Démarrage {duration}s")
+        print(f"[{project_id}] 🎬 Démarrage {duration}s — {len(video_urls)} vidéos")
 
-        # 1. TÉLÉCHARGER LES VIDÉOS (max 5 pour économiser RAM)
-        sources = []
-        for i, url in enumerate(video_urls[:5]):
-            try:
-                p = f"{tmp}/src_{i}.mp4"
-                download(url, p)
-                sources.append(p)
-                print(f"  Vidéo {i+1} ✓")
-            except Exception as e:
-                print(f"  Erreur vidéo {i}: {e}")
+        # 1. TÉLÉCHARGER TOUTES LES VIDÉOS EN PARALLÈLE
+        pairs = [(url, f"{tmp}/src_{i}.mp4") for i, url in enumerate(video_urls[:10])]
+        downloaded = download_parallel(pairs)
+        sources = [p for p in [pair[1] for pair in pairs] if os.path.exists(p)]
+        print(f"  {len(sources)} vidéos téléchargées ✓")
 
         if not sources:
             raise Exception("Aucune vidéo téléchargée")
 
-        # 2. DÉCOUPER EN CLIPS 3S (ultrafast pour économiser RAM)
-        clips = []
-        clip_idx = 0
-        clips_needed = math.ceil(duration / 3.0) + 1
+        # 2. EXTRAIRE LES CLIPS EN PARALLÈLE
+        import concurrent.futures
+        all_clips = []
+        start_idx = 0
 
-        for src in sources:
-            try:
-                src_dur = get_duration(src)
-                start = 0.0
-                while start + 2.0 <= src_dur and len(clips) < clips_needed:
-                    clip_path = f"{tmp}/clip_{clip_idx:03d}.mp4"
-                    clip_dur = min(3.0, src_dur - start)
-                    subprocess.run([
-                        'ffmpeg', '-y',
-                        '-ss', str(start), '-i', src,
-                        '-t', str(clip_dur),
-                        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
-                        '-an', clip_path
-                    ], check=True, capture_output=True)
-                    clips.append(clip_path)
-                    clip_idx += 1
-                    start += 3.0
-                    print(f"  Clip {clip_idx} ✓")
-            except Exception as e:
-                print(f"  Clip error: {e}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            futures = []
+            for src in sources:
+                futures.append(ex.submit(extract_clips_parallel, src, tmp, start_idx))
+                start_idx += 50  # Espace pour les index
 
-        if not clips:
+            for future in concurrent.futures.as_completed(futures):
+                clips = future.result()
+                all_clips.extend(clips)
+                print(f"  +{len(clips)} clips extraits")
+
+        all_clips.sort()  # Trier par nom pour garder l'ordre
+        print(f"  Total: {len(all_clips)} clips disponibles ✓")
+
+        if not all_clips:
             raise Exception("Aucun clip extrait")
 
-        # 3. ASSEMBLER
+        # 3. SÉLECTIONNER ET ASSEMBLER LES CLIPS
         needed = math.ceil(duration / 3.0)
-        selected = [clips[i % len(clips)] for i in range(needed)]
+        selected = [all_clips[i % len(all_clips)] for i in range(needed)]
 
         concat_file = f"{tmp}/concat.txt"
         with open(concat_file, 'w') as f:
@@ -154,59 +187,75 @@ def process_video(project_id, video_urls, voice_url, music_url,
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
             '-i', concat_file, '-t', str(duration),
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-r', '30',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-r', '30',
             assembled
         ], check=True, capture_output=True)
         print(f"  {len(selected)} clips assemblés ✓")
 
-        # Libérer les clips de la mémoire
-        for c in clips:
+        # Libérer les clips
+        for c in all_clips:
             try: os.remove(c)
             except: pass
+        for s in sources:
+            try: os.remove(s)
+            except: pass
 
-        # 4. VOIX + MUSIQUE
+        # 4. VOIX + MUSIQUE EN PARALLÈLE
         voice_path = music_path = None
-        if voice_url:
-            try:
-                voice_path = f"{tmp}/voice.mp3"
-                download(voice_url, voice_path)
-                print("  Voix ✓")
-            except Exception as e:
-                print(f"  Voix erreur: {e}")
 
-        if music_url:
+        def dl_voice():
+            nonlocal voice_path
+            if not voice_url: return
             try:
-                music_path = f"{tmp}/music.mp3"
-                download(music_url, music_path)
+                p = f"{tmp}/voice.mp3"
+                r = requests.get(voice_url, timeout=60)
+                r.raise_for_status()
+                with open(p, 'wb') as f: f.write(r.content)
+                voice_path = p
+                print("  Voix ✓")
+            except Exception as e: print(f"  Voix erreur: {e}")
+
+        def dl_music():
+            nonlocal music_path
+            if not music_url: return
+            try:
+                p = f"{tmp}/music.mp3"
+                r = requests.get(music_url, timeout=60)
+                r.raise_for_status()
+                with open(p, 'wb') as f: f.write(r.content)
+                music_path = p
                 print("  Musique ✓")
-            except Exception as e:
-                print(f"  Musique erreur: {e}")
+            except Exception as e: print(f"  Musique erreur: {e}")
+
+        t1 = threading.Thread(target=dl_voice)
+        t2 = threading.Thread(target=dl_music)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
 
         # 5. CAPTIONS SRT MOT PAR MOT
         srt_path = f"{tmp}/captions.srt"
         words = [w for w in voiceover.replace('\n', ' ').split() if w]
         make_srt(words, duration, srt_path)
-        print(f"  {len(words)} mots ✓")
+        print(f"  {len(words)} mots en captions ✓")
 
-        # Style captions
         styles = {
-            'bold':       {'size': 80, 'color': '&H00FFFFFF', 'outline_color': '&H00000000', 'outline': 6, 'bold': 1},
-            'minimal':    {'size': 65, 'color': '&H00FFFFFF', 'outline_color': '&H00000000', 'outline': 2, 'bold': 0},
-            'aggressive': {'size': 90, 'color': '&H0000FFFF', 'outline_color': '&H000000FF', 'outline': 8, 'bold': 1},
+            'bold':       {'size': 85, 'color': '&H00FFFFFF', 'outline_color': '&H00000000', 'outline': 7, 'bold': 1, 'shadow': 3},
+            'minimal':    {'size': 70, 'color': '&H00FFFFFF', 'outline_color': '&H00000000', 'outline': 2, 'bold': 0, 'shadow': 1},
+            'aggressive': {'size': 95, 'color': '&H0000FFFF', 'outline_color': '&H000000FF', 'outline': 9, 'bold': 1, 'shadow': 3},
         }
         st = styles.get(caption_style, styles['bold'])
-
-        srt_escaped = srt_path.replace(':', '\\:')
+        srt_escaped = srt_path.replace(':', '\\:').replace("'", "\\'")
         srt_filter = (
             f"subtitles={srt_escaped}:force_style='"
             f"FontSize={st['size']},"
             f"PrimaryColour={st['color']},"
             f"OutlineColour={st['outline_color']},"
-            f"BorderStyle=1,Outline={st['outline']},Shadow=2,"
-            f"Bold={st['bold']},Alignment=2,MarginV=250'"
+            f"BorderStyle=1,Outline={st['outline']},"
+            f"Shadow={st['shadow']},"
+            f"Bold={st['bold']},Alignment=2,MarginV=260'"
         )
 
-        # 6. MONTAGE FINAL
+        # 6. MONTAGE FINAL HAUTE QUALITÉ
         output = f"{tmp}/final.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
         n = 1
@@ -219,10 +268,12 @@ def process_video(project_id, video_urls, voice_url, music_url,
         if n == 1:
             cmd += ['-an']
         elif n == 2 and voice_path:
-            cmd += ['-filter_complex', f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[aout]',
+            cmd += ['-filter_complex',
+                    f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[aout]',
                     '-map', '0:v', '-map', '[aout]']
         elif n == 2 and music_path:
-            cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[aout]',
+            cmd += ['-filter_complex',
+                    f'[1:a]volume=0.10,atrim=0:{duration}[aout]',
                     '-map', '0:v', '-map', '[aout]']
         else:
             cmd += ['-filter_complex',
@@ -233,19 +284,21 @@ def process_video(project_id, video_urls, voice_url, music_url,
 
         cmd += [
             '-t', str(duration),
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
-            '-c:a', 'aac', '-b:a', '128k',
-            '-movflags', '+faststart', '-r', '30',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',  # Haute qualité
+            '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', '+faststart',
+            '-r', '30',
             output
         ]
 
-        print("  Rendu FFmpeg...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=400)
+        print("  🎞️ Rendu final haute qualité...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=500)
         if result.returncode != 0:
-            print("FFmpeg stderr:", result.stderr[-2000:])
-            raise Exception(f"FFmpeg: {result.stderr[-300:]}")
+            print("stderr:", result.stderr[-3000:])
+            raise Exception(f"FFmpeg: {result.stderr[-400:]}")
 
-        print(f"  Rendu OK ✓ ({os.path.getsize(output)/1024/1024:.1f}MB)")
+        size_mb = os.path.getsize(output) / 1024 / 1024
+        print(f"  ✅ Rendu OK ({size_mb:.1f}MB)")
 
         # 7. UPLOAD SUPABASE
         sb = create_client(sb_url, sb_key)
@@ -267,7 +320,7 @@ def process_video(project_id, video_urls, voice_url, music_url,
         sb.table('projects').update({'status': 'done'}) \
             .eq('id', project_id).execute()
 
-        print(f"  Upload OK ✓")
+        print(f"  ✅ Upload OK → {public_url[:60]}...")
         return public_url
 
 if __name__ == '__main__':

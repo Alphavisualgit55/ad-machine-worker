@@ -13,5 +13,4 @@ COPY . .
 
 EXPOSE 8000
 
-# Timeout 600s, 1 seul worker pour économiser la RAM
-CMD gunicorn --bind 0.0.0.0:$PORT --timeout 600 --workers 1 --threads 4 app:app
+CMD gunicorn --bind 0.0.0.0:$PORT --timeout 600 --workers 1 --threads 8 app:app
