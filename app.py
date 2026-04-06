@@ -1,9 +1,11 @@
-import os, json, math, subprocess, tempfile, requests, traceback, threading
+import os, json, math, subprocess, tempfile, requests, traceback, threading, time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+
+SUBMAGIC_KEY = os.environ.get('SUBMAGIC_API_KEY', '')
 
 @app.route('/', methods=['GET'])
 def index():
@@ -54,6 +56,7 @@ def render():
     style      = data.get('captionStyle', 'bold')
     sb_url     = data.get('supabaseUrl')
     sb_key     = data.get('supabaseKey')
+    app_url    = data.get('appUrl', '')
 
     if not pid or not video_urls:
         return jsonify({'error': 'Données manquantes'}), 400
@@ -61,8 +64,8 @@ def render():
     def run():
         sb = SB(sb_url, sb_key)
         try:
-            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb)
-            print(f"[{pid}] ✅ DONE")
+            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb, app_url)
+            print(f"[{pid}] ✅ DONE: {url[:60]}")
         except Exception as e:
             traceback.print_exc()
             print(f"[{pid}] ❌ ERROR: {e}")
@@ -76,6 +79,34 @@ def render():
     return jsonify({'success': True})
 
 
+# ===== WEBHOOK SUBMAGIC =====
+@app.route('/webhook/submagic', methods=['POST'])
+def webhook_submagic():
+    """Reçoit le webhook de Submagic quand l'export est prêt"""
+    data = request.json
+    print(f"Submagic webhook: {json.dumps(data)[:200]}")
+
+    project_id = data.get('projectId')
+    status = data.get('status')
+    direct_url = data.get('directUrl') or data.get('downloadUrl')
+
+    if not project_id or status != 'completed' or not direct_url:
+        return jsonify({'ok': True})
+
+    # Récupérer les infos du projet depuis les headers ou query
+    sb_url = request.args.get('supabaseUrl')
+    sb_key = request.args.get('supabaseKey')
+    ad_pid = request.args.get('projectId')
+
+    if sb_url and sb_key and ad_pid:
+        sb = SB(sb_url, sb_key)
+        sb.update_video(ad_pid, {'video_url': direct_url})
+        sb.update_project(ad_pid, {'status': 'done'})
+        print(f"[{ad_pid}] ✅ Submagic done: {direct_url[:60]}")
+
+    return jsonify({'ok': True})
+
+
 def dl(url, path):
     r = requests.get(url, stream=True, timeout=120)
     r.raise_for_status()
@@ -87,140 +118,138 @@ def get_dur(path):
     return float(json.loads(r.stdout)['format']['duration'])
 
 
-def make_ass(words, total_duration, path, style='bold'):
-    """Captions ASS style TikTok — fond coloré, centré, animé"""
-    if not words: return
-
-    tpw = total_duration / len(words)
-
-    # Couleurs highlight BGR pour ASS
-    COLORS = ['&H00F16363', '&H0008A9EA', '&H0085B810', '&H004444EF', '&H00CF55A8']
-
-    if style == 'aggressive':
-        font_size, primary, outline_color, outline, bold = 85, '&H0000FFFF', '&H000000FF', 8, -1
-    elif style == 'minimal':
-        font_size, primary, outline_color, outline, bold = 68, '&H00FFFFFF', '&H00000000', 3, 0
-    else:
-        font_size, primary, outline_color, outline, bold = 78, '&H00FFFFFF', '&H00000000', 7, -1
-
-    def ts(s):
-        h=int(s//3600); m=int((s%3600)//60); sec=s%60; cs=int((sec%1)*100)
-        return f"{h}:{m:02d}:{int(sec):02d}.{cs:02d}"
-
-    lines = [
-        "[Script Info]",
-        "ScriptType: v4.00+",
-        "PlayResX: 1080",
-        "PlayResY: 1920",
-        "ScaledBorderAndShadow: yes",
-        "",
-        "[V4+ Styles]",
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Normal,Arial,{font_size},{primary},&H000000FF,{outline_color},&H00000000,{bold},0,0,0,100,100,2,0,1,{outline},3,2,60,60,280,1",
-    ]
-
-    # Un style par couleur highlight
-    for i, color in enumerate(COLORS):
-        lines.append(f"Style: HL{i},Arial,{font_size},&H00FFFFFF,&H000000FF,{color},&H00000000,{bold},0,0,0,100,100,2,0,3,0,0,2,60,60,280,1")
-
-    lines += ["", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
-
-    for i, word in enumerate(words):
-        start = i * tpw
-        end = min((i + 1) * tpw, total_duration)
-        text = word.upper()
-        is_highlight = (i % 5 == 2) or len(word) > 5
-        hl_idx = (i // 5) % len(COLORS)
-        style_name = f"HL{hl_idx}" if is_highlight else "Normal"
-        # Animation pop-in
-        anim = "{\\t(0,80,\\fscx115\\fscy115)\\t(80,180,\\fscx100\\fscy100)}"
-        lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},{style_name},,0,0,0,,{anim}{text}")
-
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
-
-
-def extract_clips_from_source(src, tmp, src_idx, clips_needed):
-    """Extraire les clips 3s d'une vidéo source"""
-    clips = []
-    try:
-        src_dur = get_dur(src)
-        start = 0.0
-        clip_num = 0
-        while start + 1.5 <= src_dur and len(clips) < clips_needed:
-            out = f"{tmp}/v{src_idx}_c{clip_num:03d}.mp4"
-            cd = min(3.0, src_dur - start)
-            r = subprocess.run([
-                'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
-                '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
-                '-an', out
-            ], capture_output=True)
-            if r.returncode == 0:
-                clips.append(out)
-            clip_num += 1
-            start += 3.0
-    except Exception as e:
-        print(f"  extract error src{src_idx}: {e}")
-    return clips
-
-
 def interleave_clips(clips_by_video):
-    """
-    Alterner les clips entre les vidéos pour un montage professionnel
-    Ex: vid1_c1, vid2_c1, vid3_c1, vid1_c2, vid2_c2...
-    """
-    if not clips_by_video:
-        return []
-
+    """Alterner les clips entre les vidéos : v1c1, v2c1, v3c1, v1c2, v2c2..."""
     result = []
-    max_len = max(len(c) for c in clips_by_video)
-
+    max_len = max(len(c) for c in clips_by_video) if clips_by_video else 0
     for i in range(max_len):
         for video_clips in clips_by_video:
             if i < len(video_clips):
                 result.append(video_clips[i])
-
     return result
 
 
-def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb):
+def submagic_add_captions(video_url, pid, sb, app_url, style='bold'):
+    """Envoyer la vidéo à Submagic pour ajouter les captions pro"""
+    key = SUBMAGIC_KEY
+    if not key:
+        print("  No SUBMAGIC_API_KEY — skip captions")
+        return video_url
+
+    # Templates selon style
+    template_map = {
+        'bold': 'Hormozi 2',
+        'minimal': 'Sara',
+        'aggressive': 'Hormozi',
+    }
+    template = template_map.get(style, 'Hormozi 2')
+
+    webhook = f"{app_url}/worker/webhook/submagic?projectId={pid}&supabaseUrl={sb.url}&supabaseKey={sb.h['apikey']}" if app_url else None
+
+    payload = {
+        'title': f'AdMachine-{pid[:8]}',
+        'language': 'fr',
+        'videoUrl': video_url,
+        'templateName': template,
+        'magicZooms': True,
+        'cleanAudio': False,
+    }
+    if webhook:
+        payload['webhookUrl'] = webhook
+
+    print(f"  Sending to Submagic (template: {template})...")
+    r = requests.post('https://api.submagic.co/v1/projects', 
+        headers={'x-api-key': key, 'Content-Type': 'application/json'},
+        json=payload, timeout=30)
+
+    if not r.ok:
+        print(f"  Submagic create error: {r.status_code} {r.text[:200]}")
+        return video_url
+
+    sm_data = r.json()
+    sm_id = sm_data.get('id')
+    print(f"  Submagic project created: {sm_id}")
+
+    # Déclencher l'export
+    exp = requests.post(f'https://api.submagic.co/v1/projects/{sm_id}/export',
+        headers={'x-api-key': key, 'Content-Type': 'application/json'},
+        json={'width': 1080, 'height': 1920, 'fps': 30},
+        timeout=30)
+    print(f"  Export triggered: {exp.status_code}")
+
+    if webhook:
+        # Mode webhook — Submagic va notifier quand c'est prêt
+        print(f"  Waiting for Submagic webhook...")
+        return None  # Sera mis à jour par le webhook
+
+    # Mode polling — attendre que Submagic termine (max 5 min)
+    print(f"  Polling Submagic for result...")
+    for attempt in range(60):
+        time.sleep(5)
+        check = requests.get(f'https://api.submagic.co/v1/projects/{sm_id}',
+            headers={'x-api-key': key}, timeout=15)
+        if check.ok:
+            proj = check.json()
+            status = proj.get('status')
+            direct_url = proj.get('directUrl') or proj.get('downloadUrl')
+            print(f"  Submagic status: {status} (attempt {attempt+1})")
+            if status == 'completed' and direct_url:
+                print(f"  Submagic done! {direct_url[:60]}")
+                return direct_url
+            elif status == 'failed':
+                print(f"  Submagic failed — using original video")
+                return video_url
+
+    print(f"  Submagic timeout — using original video")
+    return video_url
+
+
+def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb, app_url):
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{pid}] START {duration}s {len(video_urls)} videos")
 
         clips_needed = math.ceil(duration / 3.0) + 2
         clips_per_video = math.ceil(clips_needed / max(len(video_urls), 1)) + 1
 
-        # 1. TÉLÉCHARGER ET EXTRAIRE EN ALTERNANT LES VIDÉOS
+        # 1. TÉLÉCHARGER ET EXTRAIRE EN ALTERNANT
         clips_by_video = []
-
         for i, url in enumerate(video_urls[:8]):
             src = f"{tmp}/src_{i}.mp4"
             try:
                 dl(url, src)
                 print(f"  video {i+1} downloaded")
-                clips = extract_clips_from_source(src, tmp, i, clips_per_video)
+
+                clips = []
+                src_dur = get_dur(src)
+                start = 0.0; c_idx = 0
+                while start + 1.5 <= src_dur and c_idx < clips_per_video:
+                    out = f"{tmp}/v{i}_c{c_idx:03d}.mp4"
+                    cd = min(3.0, src_dur - start)
+                    r = subprocess.run([
+                        'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
+                        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
+                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-an', out
+                    ], capture_output=True)
+                    if r.returncode == 0: clips.append(out)
+                    c_idx += 1; start += 3.0
+
                 if clips:
                     clips_by_video.append(clips)
-                    print(f"  video {i+1}: {len(clips)} clips extraits")
+                    print(f"  video {i+1}: {len(clips)} clips")
                 try: os.remove(src)
                 except: pass
             except Exception as e:
                 print(f"  error video {i}: {e}")
 
-        if not clips_by_video:
-            raise Exception("No clips extracted")
+        if not clips_by_video: raise Exception("No clips extracted")
 
-        # 2. INTERLEAVE — ALTERNER LES CLIPS ENTRE LES VIDÉOS
+        # 2. INTERLEAVE — alterner les clips pro
         interleaved = interleave_clips(clips_by_video)
-        print(f"  Interleaved: {len(interleaved)} clips disponibles")
-        print(f"  Ordre: {[os.path.basename(c) for c in interleaved[:6]]}...")
-
-        # 3. SÉLECTIONNER LES CLIPS NÉCESSAIRES
         needed = math.ceil(duration / 3.0)
         selected = [interleaved[i % len(interleaved)] for i in range(needed)]
+        print(f"  {len(selected)} clips selected (interleaved)")
 
-        # 4. ASSEMBLER
+        # 3. ASSEMBLER
         concat = f"{tmp}/concat.txt"
         with open(concat, 'w') as f:
             for c in selected: f.write(f"file '{c}'\n")
@@ -231,14 +260,14 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
             '-t', str(duration), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-r', '30',
             assembled
         ], check=True, capture_output=True)
-        print(f"  {len(selected)} clips assembled (alternés)")
+        print(f"  assembled OK")
 
         for clips in clips_by_video:
             for c in clips:
                 try: os.remove(c)
                 except: pass
 
-        # 5. VOIX + MUSIQUE
+        # 4. VOIX + MUSIQUE
         voice_path = music_path = None
         if voice_url:
             try:
@@ -252,63 +281,58 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                 print("  music OK")
             except Exception as e: print(f"  music error: {e}")
 
-        # 6. CAPTIONS ASS STYLE TIKTOK
-        ass_path = f"{tmp}/captions.ass"
-        words = [w for w in voiceover.replace('\n', ' ').split() if w]
-        make_ass(words, duration, ass_path, style)
-        print(f"  {len(words)} words in captions")
-
-        ass_esc = ass_path.replace(':', '\\:')
-        vf = f"ass={ass_esc}"
-
-        # 7. RENDU FINAL
-        output = f"{tmp}/final.mp4"
+        # 5. MIXAGE AUDIO
+        output_no_captions = f"{tmp}/no_captions.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
         n = 1
         if voice_path: cmd += ['-i', voice_path]; n += 1
         if music_path: cmd += ['-i', music_path]; n += 1
 
-        cmd += ['-vf', vf]
-
         if n == 1:
-            cmd += ['-an']
+            cmd += ['-c:v', 'copy', '-an']
         elif n == 2 and voice_path:
-            cmd += ['-filter_complex', f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[a]', '-map', '0:v', '-map', '[a]']
+            cmd += ['-filter_complex', f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[a]',
+                    '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k']
         elif n == 2 and music_path:
-            cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[a]', '-map', '0:v', '-map', '[a]']
+            cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[a]',
+                    '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k']
         else:
             cmd += ['-filter_complex',
                     f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[v];'
                     f'[2:a]volume=0.10,atrim=0:{duration},asetpts=PTS-STARTPTS[m];'
                     f'[v][m]amix=inputs=2:duration=first[a]',
-                    '-map', '0:v', '-map', '[a]']
+                    '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k']
 
-        cmd += ['-t', str(duration), '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
-                '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-r', '30', output]
-
-        print("  Rendering...")
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=500)
-        if res.returncode != 0:
-            print("FFmpeg error:", res.stderr[-2000:])
-            raise Exception(f"FFmpeg: {res.stderr[-300:]}")
-
-        size_mb = os.path.getsize(output) / 1024 / 1024
-        print(f"  Render OK ({size_mb:.1f}MB)")
+        cmd += ['-t', str(duration), '-movflags', '+faststart', output_no_captions]
+        subprocess.run(cmd, check=True, capture_output=True)
+        print(f"  audio mixed OK")
 
         try: os.remove(assembled)
         except: pass
 
-        # 8. UPLOAD
-        filename = f"renders/{pid}/final.mp4"
-        with open(output, 'rb') as f: video_bytes = f.read()
+        # 6. UPLOAD VIDÉO SANS CAPTIONS → SUPABASE
+        filename_raw = f"renders/{pid}/raw.mp4"
+        with open(output_no_captions, 'rb') as f: raw_bytes = f.read()
+        sb.upload('videos', filename_raw, raw_bytes)
+        raw_url = sb.public_url('videos', filename_raw)
+        print(f"  raw video uploaded: {raw_url[:60]}")
 
-        sb.upload('videos', filename, video_bytes)
-        public_url = sb.public_url('videos', filename)
-        sb.update_video(pid, {'video_url': public_url})
-        sb.update_project(pid, {'status': 'done'})
-
-        print(f"  Upload OK")
-        return public_url
+        # 7. SUBMAGIC — AJOUTER CAPTIONS PRO
+        if SUBMAGIC_KEY:
+            final_url = submagic_add_captions(raw_url, pid, sb, app_url, style)
+            if final_url:
+                sb.update_video(pid, {'video_url': final_url})
+                sb.update_project(pid, {'status': 'done'})
+                return final_url
+            else:
+                # Webhook mode — Submagic va notifier
+                print(f"  Waiting for Submagic webhook to complete...")
+                return raw_url
+        else:
+            # Pas de Submagic — utiliser la vidéo brute
+            sb.update_video(pid, {'video_url': raw_url})
+            sb.update_project(pid, {'status': 'done'})
+            return raw_url
 
 
 if __name__ == '__main__':
