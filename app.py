@@ -248,18 +248,23 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         if music_path: cmd += ['-i', music_path]; n += 1
 
         if n == 1:
+            # Pas d'audio
             cmd += ['-c:v', 'copy', '-an']
         elif n == 2 and voice_path:
-            cmd += ['-filter_complex', f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[a]',
-                    '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k']
+            # Voix seule — copie directe sans filtre pour garder le volume original
+            cmd += ['-map', '0:v', '-map', '1:a',
+                    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                    '-t', str(duration)]
         elif n == 2 and music_path:
+            # Musique seule à 10%
             cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[a]',
                     '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k']
         else:
+            # Voix + musique : voix à 100%, musique à 10%
             cmd += ['-filter_complex',
-                    f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[v];'
-                    f'[2:a]volume=0.10,atrim=0:{duration},asetpts=PTS-STARTPTS[m];'
-                    f'[v][m]amix=inputs=2:duration=first[a]',
+                    f'[1:a]asetpts=PTS-STARTPTS[v];'
+                    f'[2:a]volume=0.10,asetpts=PTS-STARTPTS[m];'
+                    f'[v][m]amix=inputs=2:duration=first:normalize=0[a]',
                     '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k']
 
         cmd += ['-t', str(duration), '-movflags', '+faststart', output]
