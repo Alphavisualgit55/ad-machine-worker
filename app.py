@@ -86,23 +86,97 @@ def get_dur(path):
     r = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path], capture_output=True, text=True)
     return float(json.loads(r.stdout)['format']['duration'])
 
-def make_srt(words, total, path):
+
+def make_ass(words, total_duration, path, style='bold'):
+    """Générer fichier ASS avec captions style TikTok — couleurs, centré, animé"""
     if not words: return
-    tpw = total / len(words)
+
+    tpw = total_duration / len(words)
+
+    # Couleurs highlight en BGR (format ASS)
+    COLORS = [
+        '&H00F16363',  # Bleu indigo
+        '&H0008A9EA',  # Jaune
+        '&H0085B810',  # Vert
+        '&H004444EF',  # Rouge
+        '&H00CF55A8',  # Violet
+    ]
+
+    # Config selon style
+    if style == 'aggressive':
+        font_size = 88
+        primary = '&H0000FFFF'   # Jaune
+        outline_color = '&H000000FF'  # Rouge
+        outline = 8
+        bold = -1
+    elif style == 'minimal':
+        font_size = 70
+        primary = '&H00FFFFFF'
+        outline_color = '&H00000000'
+        outline = 3
+        bold = 0
+    else:  # bold
+        font_size = 80
+        primary = '&H00FFFFFF'
+        outline_color = '&H00000000'
+        outline = 7
+        bold = -1
+
     def ts(s):
-        h=int(s//3600); m=int((s%3600)//60); sec=s%60; ms=int((sec%1)*1000)
-        return f"{h:02d}:{m:02d}:{int(sec):02d},{ms:03d}"
+        h=int(s//3600); m=int((s%3600)//60); sec=s%60; cs=int((sec%1)*100)
+        return f"{h}:{m:02d}:{int(sec):02d}.{cs:02d}"
+
+    lines = []
+    lines.append("[Script Info]")
+    lines.append("ScriptType: v4.00+")
+    lines.append("PlayResX: 1080")
+    lines.append("PlayResY: 1920")
+    lines.append("ScaledBorderAndShadow: yes")
+    lines.append("")
+    lines.append("[V4+ Styles]")
+    lines.append("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding")
+
+    # Style normal
+    lines.append(f"Style: Normal,Arial,{font_size},{primary},&H000000FF,{outline_color},&H00000000,{bold},0,0,0,100,100,0,0,1,{outline},3,2,60,60,280,1")
+
+    # Style highlight (fond coloré)
+    for i, color in enumerate(COLORS):
+        lines.append(f"Style: HL{i},Arial,{font_size},&H00FFFFFF,&H000000FF,{color},&H00000000,{bold},0,0,0,100,100,0,0,3,0,0,2,60,60,280,1")
+
+    lines.append("")
+    lines.append("[Events]")
+    lines.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+
+    for i, word in enumerate(words):
+        start = i * tpw
+        end = min((i + 1) * tpw, total_duration)
+        text = word.upper()
+
+        is_highlight = (i % 5 == 2) or len(word) > 5
+        hl_idx = (i // 5) % len(COLORS)
+
+        if is_highlight:
+            # Fond coloré avec animation pop
+            style_name = f"HL{hl_idx}"
+            animated_text = f"{{\\t(0,80,\\fscx110\\fscy110)\\t(80,160,\\fscx100\\fscy100)}}{text}"
+        else:
+            style_name = "Normal"
+            # Animation pop-in
+            animated_text = f"{{\\t(0,80,\\fscx110\\fscy110)\\t(80,160,\\fscx100\\fscy100)}}{text}"
+
+        lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},{style_name},,0,0,0,,{animated_text}")
+
     with open(path, 'w', encoding='utf-8') as f:
-        for i, w in enumerate(words):
-            f.write(f"{i+1}\n{ts(i*tpw)} --> {ts(min((i+1)*tpw,total))}\n{w.upper()}\n\n")
+        f.write('\n'.join(lines))
+
 
 def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb):
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{pid}] START {duration}s {len(video_urls)} videos")
 
-        # 1. TÉLÉCHARGER UNE PAR UNE (économise RAM)
+        # 1. TÉLÉCHARGER
         sources = []
-        for i, url in enumerate(video_urls[:6]):  # Max 6 vidéos
+        for i, url in enumerate(video_urls[:6]):
             p = f"{tmp}/src_{i}.mp4"
             try:
                 dl(url, p)
@@ -113,7 +187,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
 
         if not sources: raise Exception("No videos downloaded")
 
-        # 2. EXTRAIRE CLIPS 3S - UNE VIDÉO À LA FOIS (économise RAM)
+        # 2. EXTRAIRE CLIPS 3S
         all_clips = []
         clips_needed = math.ceil(duration / 3.0) + 2
 
@@ -133,12 +207,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                     ], capture_output=True)
                     if r.returncode == 0:
                         all_clips.append(out)
-                        print(f"  clip {len(all_clips)} extracted")
+                        print(f"  clip {len(all_clips)} OK")
                     idx += 1; start += 3.0
             except Exception as e:
                 print(f"  extract error: {e}")
-
-            # Supprimer la source après extraction pour libérer RAM
             try: os.remove(src)
             except: pass
 
@@ -160,7 +232,6 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         ], check=True, capture_output=True)
         print(f"  assembled OK")
 
-        # Libérer les clips
         for c in all_clips:
             try: os.remove(c)
             except: pass
@@ -179,25 +250,14 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                 print("  music OK")
             except Exception as e: print(f"  music error: {e}")
 
-        # 5. CAPTIONS
-        srt = f"{tmp}/captions.srt"
+        # 5. CAPTIONS ASS STYLE TIKTOK
+        ass_path = f"{tmp}/captions.ass"
         words = [w for w in voiceover.replace('\n', ' ').split() if w]
-        make_srt(words, duration, srt)
-        print(f"  {len(words)} words")
+        make_ass(words, duration, ass_path, style)
+        print(f"  {len(words)} words in ASS captions")
 
-        styles = {
-            'bold':       {'size': 85, 'color': '&H00FFFFFF', 'oc': '&H00000000', 'outline': 7, 'bold': 1, 'shadow': 3},
-            'minimal':    {'size': 70, 'color': '&H00FFFFFF', 'oc': '&H00000000', 'outline': 2, 'bold': 0, 'shadow': 1},
-            'aggressive': {'size': 95, 'color': '&H0000FFFF', 'oc': '&H000000FF', 'outline': 9, 'bold': 1, 'shadow': 3},
-        }
-        st = styles.get(style, styles['bold'])
-        srt_esc = srt.replace(':', '\\:')
-        srt_filter = (
-            f"subtitles={srt_esc}:force_style='"
-            f"FontSize={st['size']},PrimaryColour={st['color']},"
-            f"OutlineColour={st['oc']},BorderStyle=1,Outline={st['outline']},"
-            f"Shadow={st['shadow']},Bold={st['bold']},Alignment=2,MarginV=260'"
-        )
+        ass_esc = ass_path.replace(':', '\\:')
+        vf = f"ass={ass_esc}"
 
         # 6. RENDU FINAL
         output = f"{tmp}/final.mp4"
@@ -205,7 +265,8 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         n = 1
         if voice_path: cmd += ['-i', voice_path]; n += 1
         if music_path: cmd += ['-i', music_path]; n += 1
-        cmd += ['-vf', srt_filter]
+
+        cmd += ['-vf', vf]
 
         if n == 1:
             cmd += ['-an']
@@ -232,7 +293,6 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"  Render OK ({size_mb:.1f}MB)")
 
-        # Supprimer assembled pour libérer RAM avant upload
         try: os.remove(assembled)
         except: pass
 
