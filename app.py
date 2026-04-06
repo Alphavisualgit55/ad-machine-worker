@@ -96,29 +96,19 @@ def interleave_clips(clips_by_video):
     return result
 
 
-def submagic_process(video_with_voice_path, pid, style):
-    """
-    Envoie la vidéo AVEC VOIX à Submagic pour captions pro.
-    Submagic transcrit la voix et génère les captions automatiquement.
-    """
-    key = os.environ.get('SUBMAGIC_API_KEY', '').strip()
-    print(f"  SUBMAGIC_API_KEY: {'✅ OK' if key else '❌ MISSING'}")
-    if not key:
-        return None
+def submagic_process(video_path, pid, style):
+    """Envoie la vidéo AVEC VOIX à Submagic pour captions pro"""
+    key = 'sk-65c7ec039cc99e9f86333a018e208550f8b4f9725dfe80e8a8d2103ad53aed0f'
+    print(f"  SUBMAGIC: starting...")
 
-    # Template selon style
-    template_map = {
-        'bold': 'Hormozi 2',
-        'minimal': 'Sara',
-        'aggressive': 'Beast',
-    }
+    template_map = {'bold': 'Hormozi 2', 'minimal': 'Sara', 'aggressive': 'Beast'}
     template = template_map.get(style, 'Hormozi 2')
     print(f"  Template: {template}")
 
-    # 1. UPLOAD FICHIER DIRECT À SUBMAGIC (avec voix dedans)
+    # 1. UPLOAD FICHIER DIRECT À SUBMAGIC
     print(f"  Uploading to Submagic...")
     try:
-        with open(video_with_voice_path, 'rb') as f:
+        with open(video_path, 'rb') as f:
             r = requests.post(
                 'https://api.submagic.co/v1/projects/upload',
                 headers={'x-api-key': key},
@@ -135,23 +125,19 @@ def submagic_process(video_with_voice_path, pid, style):
         print(f"  Upload error: {e}")
         return None
 
-    print(f"  Submagic upload: {r.status_code}")
+    print(f"  Submagic upload: {r.status_code} {r.text[:200]}")
     if not r.ok:
-        print(f"  Error: {r.text[:300]}")
         return None
 
-    sm_data = r.json()
-    sm_id = sm_data.get('id')
+    sm_id = r.json().get('id')
     print(f"  Project ID: {sm_id}")
 
-    # 2. ATTENDRE LA TRANSCRIPTION (status: transcribing → processing)
+    # 2. ATTENDRE TRANSCRIPTION
     print(f"  Waiting for transcription...")
     for i in range(30):
         time.sleep(5)
-        check = requests.get(
-            f'https://api.submagic.co/v1/projects/{sm_id}',
-            headers={'x-api-key': key}, timeout=15
-        )
+        check = requests.get(f'https://api.submagic.co/v1/projects/{sm_id}',
+            headers={'x-api-key': key}, timeout=15)
         if check.ok:
             proj = check.json()
             status = proj.get('status')
@@ -160,35 +146,28 @@ def submagic_process(video_with_voice_path, pid, style):
             if transcription == 'COMPLETED' or status == 'processing':
                 break
             elif status == 'failed':
-                print(f"  ❌ Failed: {proj.get('failureReason')}")
+                print(f"  Failed: {proj.get('failureReason')}")
                 return None
 
     # 3. DÉCLENCHER L'EXPORT
     print(f"  Triggering export...")
-    exp = requests.post(
-        f'https://api.submagic.co/v1/projects/{sm_id}/export',
+    exp = requests.post(f'https://api.submagic.co/v1/projects/{sm_id}/export',
         headers={'x-api-key': key, 'Content-Type': 'application/json'},
-        json={'width': 1080, 'height': 1920, 'fps': 30},
-        timeout=30
-    )
-    print(f"  Export: {exp.status_code} {exp.text[:100]}")
+        json={'width': 1080, 'height': 1920, 'fps': 30}, timeout=30)
+    print(f"  Export: {exp.status_code}")
 
-    # 4. POLLING JUSQU'À COMPLETED
-    print(f"  Polling for result...")
+    # 4. POLLING
     for i in range(96):
         time.sleep(5)
-        check = requests.get(
-            f'https://api.submagic.co/v1/projects/{sm_id}',
-            headers={'x-api-key': key}, timeout=15
-        )
+        check = requests.get(f'https://api.submagic.co/v1/projects/{sm_id}',
+            headers={'x-api-key': key}, timeout=15)
         if check.ok:
             proj = check.json()
             status = proj.get('status')
             direct_url = proj.get('directUrl') or proj.get('downloadUrl')
-            if i % 4 == 0:
-                print(f"  [{i+1}] status={status}")
+            if i % 4 == 0: print(f"  [{i+1}] status={status}")
             if status == 'completed' and direct_url:
-                print(f"  ✅ Submagic done! {direct_url[:60]}")
+                print(f"  ✅ Submagic done!")
                 return direct_url
             elif status == 'failed':
                 print(f"  ❌ Failed: {proj.get('failureReason')}")
@@ -271,7 +250,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                 print("  music OK")
             except Exception as e: print(f"  music error: {e}")
 
-        # 4. MIXAGE FINAL — vidéo avec voix (pour Submagic)
+        # 4. MIXAGE FINAL
         output = f"{tmp}/final.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
         n = 1
@@ -281,14 +260,12 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         if n == 1:
             cmd += ['-an']
         elif n == 2 and voice_path:
-            # Voix originale sans modification
             cmd += ['-map', '0:v', '-map', '1:a',
                     '-c:a', 'aac', '-b:a', '192k', '-t', str(duration)]
         elif n == 2 and music_path:
             cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
         else:
-            # Voix 100% + musique 10%
             cmd += ['-filter_complex',
                     f'[1:a]asetpts=PTS-STARTPTS[v];'
                     f'[2:a]volume=0.10,asetpts=PTS-STARTPTS[m];'
@@ -300,23 +277,22 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
 
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if res.returncode != 0:
-            raise Exception(f"FFmpeg mix: {res.stderr[-300:]}")
+            raise Exception(f"FFmpeg: {res.stderr[-300:]}")
 
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"  mix OK ({size_mb:.1f}MB)")
         try: os.remove(assembled)
         except: pass
 
-        # 5. SUBMAGIC — envoie la vidéo AVEC voix pour les captions
+        # 5. SUBMAGIC — captions pro
         final_url = submagic_process(output, pid, style)
 
         if final_url:
-            # Submagic a réussi → utiliser sa vidéo
             sb.update_video(pid, {'video_url': final_url})
             sb.update_project(pid, {'status': 'done'})
             return final_url
 
-        # Fallback — upload sur Supabase sans captions Submagic
+        # Fallback Supabase
         print("  Fallback: uploading to Supabase...")
         filename = f"renders/{pid}/final.mp4"
         with open(output, 'rb') as f: video_bytes = f.read()
