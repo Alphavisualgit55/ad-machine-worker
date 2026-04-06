@@ -1,10 +1,4 @@
-import os
-import json
-import uuid
-import subprocess
-import tempfile
-import requests
-import math
+import os, json, math, subprocess, tempfile, requests, traceback, threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
@@ -12,351 +6,268 @@ from supabase import create_client
 app = Flask(__name__)
 CORS(app)
 
-SUPABASE_URL = os.environ.get('SUPABASE_URL')
-SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-
-def get_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({'name': 'Ad Machine Worker', 'status': 'running'})
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'ffmpeg': check_ffmpeg()})
-
-def check_ffmpeg():
     try:
-        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
-        return 'ok' if result.returncode == 0 else 'missing'
-    except:
-        return 'missing'
+        r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        return jsonify({'status': 'ok', 'ffmpeg': 'ok'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/render', methods=['POST'])
 def render():
     data = request.json
-    project_id = data.get('projectId')
-    video_urls = data.get('videoUrls', [])
-    voice_url = data.get('voiceUrl')
-    music_url = data.get('musicUrl')
-    captions = data.get('captions', [])
-    voiceover = data.get('voiceover', '')
-    duration = int(data.get('duration', 30))
+    project_id    = data.get('projectId')
+    video_urls    = data.get('videoUrls', [])
+    voice_url     = data.get('voiceUrl')
+    music_url     = data.get('musicUrl')
+    voiceover     = data.get('voiceover', '')
+    duration      = int(data.get('duration', 30))
     caption_style = data.get('captionStyle', 'bold')
-    supabase_url = data.get('supabaseUrl')
-    supabase_key = data.get('supabaseKey')
+    sb_url        = data.get('supabaseUrl')
+    sb_key        = data.get('supabaseKey')
 
     if not project_id or not video_urls:
-        return jsonify({'error': 'projectId et videoUrls requis'}), 400
+        return jsonify({'error': 'Données manquantes'}), 400
 
-    try:
-        result_url = process_video(
-            project_id=project_id,
-            video_urls=video_urls,
-            voice_url=voice_url,
-            music_url=music_url,
-            captions=captions,
-            voiceover=voiceover,
-            duration=duration,
-            caption_style=caption_style,
-            supabase_url=supabase_url,
-            supabase_key=supabase_key,
-        )
-        return jsonify({'success': True, 'url': result_url})
-    except Exception as e:
-        print(f'Render error: {e}')
-        return jsonify({'error': str(e)}), 500
-
-def download_file(url, path):
-    """Télécharger un fichier depuis une URL"""
-    response = requests.get(url, stream=True, timeout=120)
-    response.raise_for_status()
-    with open(path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
-    return path
-
-def get_video_duration(path):
-    """Obtenir la durée d'une vidéo"""
-    result = subprocess.run([
-        'ffprobe', '-v', 'quiet', '-print_format', 'json',
-        '-show_format', path
-    ], capture_output=True, text=True)
-    data = json.loads(result.stdout)
-    return float(data['format']['duration'])
-
-def extract_clip(input_path, output_path, start, duration):
-    """Extraire un clip d'une vidéo"""
-    subprocess.run([
-        'ffmpeg', '-y',
-        '-ss', str(start),
-        '-i', input_path,
-        '-t', str(duration),
-        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-        '-r', '30',
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-an',
-        output_path
-    ], check=True, capture_output=True)
-
-def process_video(project_id, video_urls, voice_url, music_url, captions,
-                  voiceover, duration, caption_style, supabase_url, supabase_key):
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        print(f"Traitement projet {project_id}, durée: {duration}s")
-
-        # ===== 1. TÉLÉCHARGER LES VIDÉOS B-ROLL =====
-        downloaded_videos = []
-        for i, url in enumerate(video_urls[:10]):
+    # Lancer en thread pour éviter le timeout HTTP
+    def run():
+        try:
+            url = process_video(
+                project_id, video_urls, voice_url, music_url,
+                voiceover, duration, caption_style, sb_url, sb_key
+            )
+            print(f"[{project_id}] Terminé: {url}")
+        except Exception as e:
+            traceback.print_exc()
             try:
-                path = os.path.join(tmpdir, f'source_{i}.mp4')
-                download_file(url, path)
-                downloaded_videos.append(path)
-                print(f"Vidéo {i+1} téléchargée")
-            except Exception as e:
-                print(f"Erreur téléchargement vidéo {i}: {e}")
+                sb = create_client(sb_url, sb_key)
+                vids = sb.table('videos').select('*') \
+                    .eq('project_id', project_id).eq('generated', False).execute()
+                if vids.data:
+                    sb.table('videos').insert({
+                        'project_id': project_id,
+                        'video_url': vids.data[0]['video_url'],
+                        'generated': True
+                    }).execute()
+                sb.table('projects').update({'status': 'done'}) \
+                    .eq('id', project_id).execute()
+            except: pass
 
-        if not downloaded_videos:
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    # Répondre immédiatement — le traitement continue en background
+    return jsonify({'success': True, 'message': 'Traitement en cours'})
+
+def download(url, path):
+    r = requests.get(url, stream=True, timeout=120)
+    r.raise_for_status()
+    with open(path, 'wb') as f:
+        for chunk in r.iter_content(8192):
+            f.write(chunk)
+
+def get_duration(path):
+    r = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path],
+        capture_output=True, text=True
+    )
+    return float(json.loads(r.stdout)['format']['duration'])
+
+def make_srt(words, total_duration, path):
+    if not words: return
+    tpw = total_duration / len(words)
+    def ts(s):
+        h=int(s//3600); m=int((s%3600)//60)
+        sec=s%60; ms=int((sec%1)*1000)
+        return f"{h:02d}:{m:02d}:{int(sec):02d},{ms:03d}"
+    with open(path, 'w', encoding='utf-8') as f:
+        for i, w in enumerate(words):
+            s = i * tpw
+            e = min((i+1)*tpw, total_duration)
+            f.write(f"{i+1}\n{ts(s)} --> {ts(e)}\n{w.upper()}\n\n")
+
+def process_video(project_id, video_urls, voice_url, music_url,
+                  voiceover, duration, caption_style, sb_url, sb_key):
+
+    with tempfile.TemporaryDirectory() as tmp:
+        print(f"[{project_id}] Démarrage {duration}s")
+
+        # 1. TÉLÉCHARGER LES VIDÉOS (max 5 pour économiser RAM)
+        sources = []
+        for i, url in enumerate(video_urls[:5]):
+            try:
+                p = f"{tmp}/src_{i}.mp4"
+                download(url, p)
+                sources.append(p)
+                print(f"  Vidéo {i+1} ✓")
+            except Exception as e:
+                print(f"  Erreur vidéo {i}: {e}")
+
+        if not sources:
             raise Exception("Aucune vidéo téléchargée")
 
-        # ===== 2. DÉCOUPER EN CLIPS DE 3 SECONDES =====
+        # 2. DÉCOUPER EN CLIPS 3S (ultrafast pour économiser RAM)
         clips = []
-        clip_duration = 3.0
-        clips_needed = math.ceil(duration / clip_duration)
-        clip_index = 0
+        clip_idx = 0
+        clips_needed = math.ceil(duration / 3.0) + 1
 
-        for video_path in downloaded_videos:
+        for src in sources:
             try:
-                vid_duration = get_video_duration(video_path)
-                # Extraire plusieurs clips de 3s depuis chaque vidéo
-                start = 0
-                while start + clip_duration <= vid_duration and len(clips) < clips_needed * 2:
-                    clip_path = os.path.join(tmpdir, f'clip_{clip_index}.mp4')
-                    extract_clip(video_path, clip_path, start, clip_duration)
+                src_dur = get_duration(src)
+                start = 0.0
+                while start + 2.0 <= src_dur and len(clips) < clips_needed:
+                    clip_path = f"{tmp}/clip_{clip_idx:03d}.mp4"
+                    clip_dur = min(3.0, src_dur - start)
+                    subprocess.run([
+                        'ffmpeg', '-y',
+                        '-ss', str(start), '-i', src,
+                        '-t', str(clip_dur),
+                        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
+                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+                        '-an', clip_path
+                    ], check=True, capture_output=True)
                     clips.append(clip_path)
-                    clip_index += 1
-                    start += clip_duration
-                    print(f"Clip {clip_index} extrait ({start:.1f}s)")
+                    clip_idx += 1
+                    start += 3.0
+                    print(f"  Clip {clip_idx} ✓")
             except Exception as e:
-                print(f"Erreur extraction clip: {e}")
+                print(f"  Clip error: {e}")
 
         if not clips:
             raise Exception("Aucun clip extrait")
 
-        # Sélectionner les clips nécessaires (cyclique si pas assez)
-        selected_clips = []
-        for i in range(clips_needed):
-            selected_clips.append(clips[i % len(clips)])
+        # 3. ASSEMBLER
+        needed = math.ceil(duration / 3.0)
+        selected = [clips[i % len(clips)] for i in range(needed)]
 
-        print(f"{len(selected_clips)} clips sélectionnés pour {duration}s")
+        concat_file = f"{tmp}/concat.txt"
+        with open(concat_file, 'w') as f:
+            for c in selected:
+                f.write(f"file '{c}'\n")
 
-        # ===== 3. CRÉER LA LISTE DE CLIPS (concat) =====
-        concat_list = os.path.join(tmpdir, 'concat.txt')
-        with open(concat_list, 'w') as f:
-            for clip in selected_clips:
-                f.write(f"file '{clip}'\n")
-
-        # Assembler les clips
-        assembled = os.path.join(tmpdir, 'assembled.mp4')
+        assembled = f"{tmp}/assembled.mp4"
         subprocess.run([
-            'ffmpeg', '-y',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', concat_list,
-            '-t', str(duration),
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '22',
-            '-r', '30',
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+            '-i', concat_file, '-t', str(duration),
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-r', '30',
             assembled
         ], check=True, capture_output=True)
-        print("Clips assemblés")
+        print(f"  {len(selected)} clips assemblés ✓")
 
-        # ===== 4. TÉLÉCHARGER LA VOIX OFF =====
-        voice_path = None
+        # Libérer les clips de la mémoire
+        for c in clips:
+            try: os.remove(c)
+            except: pass
+
+        # 4. VOIX + MUSIQUE
+        voice_path = music_path = None
         if voice_url:
             try:
-                voice_path = os.path.join(tmpdir, 'voice.mp3')
-                download_file(voice_url, voice_path)
-                print("Voix off téléchargée")
+                voice_path = f"{tmp}/voice.mp3"
+                download(voice_url, voice_path)
+                print("  Voix ✓")
             except Exception as e:
-                print(f"Erreur voix: {e}")
+                print(f"  Voix erreur: {e}")
 
-        # ===== 5. TÉLÉCHARGER LA MUSIQUE =====
-        music_path = None
         if music_url:
             try:
-                music_path = os.path.join(tmpdir, 'music.mp3')
-                download_file(music_url, music_path)
-                print("Musique téléchargée")
+                music_path = f"{tmp}/music.mp3"
+                download(music_url, music_path)
+                print("  Musique ✓")
             except Exception as e:
-                print(f"Erreur musique: {e}")
+                print(f"  Musique erreur: {e}")
 
-        # ===== 6. GÉNÉRER LES CAPTIONS SRT =====
-        srt_path = os.path.join(tmpdir, 'captions.srt')
+        # 5. CAPTIONS SRT MOT PAR MOT
+        srt_path = f"{tmp}/captions.srt"
+        words = [w for w in voiceover.replace('\n', ' ').split() if w]
+        make_srt(words, duration, srt_path)
+        print(f"  {len(words)} mots ✓")
 
-        # Construire les captions mot par mot depuis le voiceover
-        words = voiceover.split() if voiceover else []
-        total_words = len(words)
-        srt_entries = []
-
-        if words and duration > 0:
-            time_per_word = duration / total_words
-            for i, word in enumerate(words):
-                start_sec = i * time_per_word
-                end_sec = (i + 1) * time_per_word
-
-                def sec_to_srt(s):
-                    h = int(s // 3600)
-                    m = int((s % 3600) // 60)
-                    sec = s % 60
-                    ms = int((sec % 1) * 1000)
-                    return f"{h:02d}:{m:02d}:{int(sec):02d},{ms:03d}"
-
-                srt_entries.append(
-                    f"{i+1}\n{sec_to_srt(start_sec)} --> {sec_to_srt(end_sec)}\n{word.upper()}\n"
-                )
-
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(srt_entries))
-
-        # ===== 7. STYLE CAPTIONS =====
+        # Style captions
         styles = {
-            'bold': {
-                'fontsize': 90,
-                'fontcolor': 'white',
-                'bordercolor': 'black',
-                'borderw': 8,
-                'box': 0,
-                'font': 'Montserrat-Black',
-            },
-            'minimal': {
-                'fontsize': 72,
-                'fontcolor': 'white',
-                'bordercolor': 'black',
-                'borderw': 4,
-                'box': 1,
-                'boxcolor': 'black@0.5',
-                'boxborderw': 12,
-                'font': 'Montserrat-Bold',
-            },
-            'aggressive': {
-                'fontsize': 96,
-                'fontcolor': 'yellow',
-                'bordercolor': 'red',
-                'borderw': 9,
-                'box': 0,
-                'font': 'Montserrat-Black',
-            },
+            'bold':       {'size': 80, 'color': '&H00FFFFFF', 'outline_color': '&H00000000', 'outline': 6, 'bold': 1},
+            'minimal':    {'size': 65, 'color': '&H00FFFFFF', 'outline_color': '&H00000000', 'outline': 2, 'bold': 0},
+            'aggressive': {'size': 90, 'color': '&H0000FFFF', 'outline_color': '&H000000FF', 'outline': 8, 'bold': 1},
         }
-        s = styles.get(caption_style, styles['bold'])
+        st = styles.get(caption_style, styles['bold'])
 
-        # ===== 8. ASSEMBLER TOUT AVEC FFMPEG =====
-        output_path = os.path.join(tmpdir, 'final.mp4')
-
-        # Construire le filtre subtitles
-        subtitle_filter = (
-            f"subtitles={srt_path}:force_style='"
-            f"FontName=DejaVu Sans Bold,"
-            f"FontSize={s['fontsize']},"
-            f"PrimaryColour=&H00FFFFFF,"
-            f"OutlineColour=&H00000000,"
-            f"BorderStyle=1,"
-            f"Outline={s['borderw']},"
-            f"Shadow=3,"
-            f"Alignment=2,"
-            f"MarginV=300'"
+        srt_escaped = srt_path.replace(':', '\\:')
+        srt_filter = (
+            f"subtitles={srt_escaped}:force_style='"
+            f"FontSize={st['size']},"
+            f"PrimaryColour={st['color']},"
+            f"OutlineColour={st['outline_color']},"
+            f"BorderStyle=1,Outline={st['outline']},Shadow=2,"
+            f"Bold={st['bold']},Alignment=2,MarginV=250'"
         )
 
-        # Construire la commande FFmpeg selon les pistes disponibles
+        # 6. MONTAGE FINAL
+        output = f"{tmp}/final.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
-        audio_inputs = []
-        input_count = 1
+        n = 1
 
-        if voice_path:
-            cmd += ['-i', voice_path]
-            audio_inputs.append(f'[{input_count}:a]')
-            input_count += 1
+        if voice_path: cmd += ['-i', voice_path]; n += 1
+        if music_path: cmd += ['-i', music_path]; n += 1
 
-        if music_path:
-            cmd += ['-i', music_path]
-            audio_inputs.append(f'[{input_count}:a]volume=0.10')
-            input_count += 1
+        cmd += ['-vf', srt_filter]
 
-        # Filtre vidéo avec captions
-        vf = subtitle_filter
-
-        if audio_inputs:
-            if len(audio_inputs) == 1:
-                filter_complex = f"{audio_inputs[0]}atrim=0:{duration}[aout]"
-                if music_path and not voice_path:
-                    filter_complex = f"[1:a]volume=0.10,atrim=0:{duration}[aout]"
-                cmd += [
-                    '-vf', vf,
-                    '-filter_complex', filter_complex,
-                    '-map', '0:v',
-                    '-map', '[aout]',
-                ]
-            else:
-                # Voix + musique : mixer
-                filter_complex = (
-                    f"[1:a]atrim=0:{duration}[voice];"
-                    f"[2:a]volume=0.10,atrim=0:{duration}[music];"
-                    f"[voice][music]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-                )
-                cmd += [
-                    '-vf', vf,
-                    '-filter_complex', filter_complex,
-                    '-map', '0:v',
-                    '-map', '[aout]',
-                ]
+        if n == 1:
+            cmd += ['-an']
+        elif n == 2 and voice_path:
+            cmd += ['-filter_complex', f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[aout]',
+                    '-map', '0:v', '-map', '[aout]']
+        elif n == 2 and music_path:
+            cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[aout]',
+                    '-map', '0:v', '-map', '[aout]']
         else:
-            cmd += ['-vf', vf, '-an']
+            cmd += ['-filter_complex',
+                    f'[1:a]atrim=0:{duration},asetpts=PTS-STARTPTS[v];'
+                    f'[2:a]volume=0.10,atrim=0:{duration},asetpts=PTS-STARTPTS[m];'
+                    f'[v][m]amix=inputs=2:duration=first[aout]',
+                    '-map', '0:v', '-map', '[aout]']
 
         cmd += [
             '-t', str(duration),
-            '-c:v', 'libx264',
-            '-preset', 'medium',
-            '-crf', '20',
-            '-c:a', 'aac',
-            '-b:a', '192k',
-            '-movflags', '+faststart',
-            '-r', '30',
-            output_path
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart', '-r', '30',
+            output
         ]
 
-        print(f"Lancement FFmpeg final...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
+        print("  Rendu FFmpeg...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=400)
         if result.returncode != 0:
             print("FFmpeg stderr:", result.stderr[-2000:])
-            raise Exception(f"FFmpeg échoué: {result.stderr[-500:]}")
+            raise Exception(f"FFmpeg: {result.stderr[-300:]}")
 
-        print("Vidéo finale générée")
+        print(f"  Rendu OK ✓ ({os.path.getsize(output)/1024/1024:.1f}MB)")
 
-        # ===== 9. UPLOAD VERS SUPABASE =====
-        sb = create_client(supabase_url, supabase_key)
+        # 7. UPLOAD SUPABASE
+        sb = create_client(sb_url, sb_key)
         filename = f"renders/{project_id}/final.mp4"
 
-        with open(output_path, 'rb') as f:
-            video_data = f.read()
+        with open(output, 'rb') as f:
+            video_bytes = f.read()
 
         sb.storage.from_('videos').upload(
-            filename,
-            video_data,
+            filename, video_bytes,
             {'content-type': 'video/mp4', 'upsert': 'true'}
         )
 
-        url_data = sb.storage.from_('videos').get_public_url(filename)
-        public_url = url_data if isinstance(url_data, str) else url_data.get('publicUrl', '')
+        url_result = sb.storage.from_('videos').get_public_url(filename)
+        public_url = url_result if isinstance(url_result, str) else url_result.get('publicUrl', '')
 
-        print(f"Vidéo uploadée: {public_url}")
-
-        # Mettre à jour Supabase
         sb.table('videos').update({'video_url': public_url}) \
             .eq('project_id', project_id).eq('generated', True).execute()
         sb.table('projects').update({'status': 'done'}) \
             .eq('id', project_id).execute()
 
+        print(f"  Upload OK ✓")
         return public_url
 
 if __name__ == '__main__':
