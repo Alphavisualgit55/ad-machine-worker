@@ -1,4 +1,4 @@
-import os, json, math, subprocess, tempfile, requests, traceback, threading, time
+import os, json, math, subprocess, tempfile, requests, traceback, threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -63,7 +63,7 @@ def render():
         sb = SB(sb_url, sb_key)
         try:
             url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb)
-            print(f"[{pid}] ✅ DONE: {url[:80]}")
+            print(f"[{pid}] ✅ DONE")
         except Exception as e:
             traceback.print_exc()
             print(f"[{pid}] ❌ ERROR: {e}")
@@ -95,75 +95,47 @@ def interleave_clips(clips_by_video):
             if i < len(vc): result.append(vc[i])
     return result
 
+def make_ass(words, total_duration, path, style='bold'):
+    if not words: return
+    tpw = total_duration / len(words)
+    COLORS = ['&H00F47A63', '&H0008C4F5', '&H0068C96B', '&H004040EF', '&H00CF5BA8']
 
-def submagic_upload_and_process(video_path, pid, style):
-    """Upload directement le fichier à Submagic — pas besoin d'URL publique"""
-    key = os.environ.get('SUBMAGIC_API_KEY', '').strip()
-    print(f"  SUBMAGIC_API_KEY: {'✅ present' if key else '❌ MISSING'}")
+    if style == 'aggressive':
+        font_size, primary, outline_color, outline, bold = 82, '&H0000FFFF', '&H000000FF', 8, -1
+    elif style == 'minimal':
+        font_size, primary, outline_color, outline, bold = 65, '&H00FFFFFF', '&H00000000', 3, 0
+    else:
+        font_size, primary, outline_color, outline, bold = 75, '&H00FFFFFF', '&H00000000', 6, -1
 
-    if not key:
-        return None
+    def ts(s):
+        h=int(s//3600); m=int((s%3600)//60); sec=s%60; cs=int((sec%1)*100)
+        return f"{h}:{m:02d}:{int(sec):02d}.{cs:02d}"
 
-    template_map = {'bold': 'Hormozi 2', 'minimal': 'Sara', 'aggressive': 'Hormozi'}
-    template = template_map.get(style, 'Hormozi 2')
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+",
+        "PlayResX: 1080", "PlayResY: 1920", "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Normal,Arial,{font_size},{primary},&H000000FF,{outline_color},&H00000000,{bold},0,0,0,100,100,0,0,1,{outline},3,2,60,60,280,1",
+    ]
+    for i, color in enumerate(COLORS):
+        lines.append(f"Style: HL{i},Arial,{font_size},&H00FFFFFF,&H000000FF,{color},&H00000000,{bold},0,0,0,100,100,0,0,3,0,0,2,60,60,280,1")
 
-    print(f"  Uploading to Submagic (template={template})...")
+    lines += ["", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
 
-    # Upload direct du fichier — pas besoin d'URL publique !
-    with open(video_path, 'rb') as f:
-        r = requests.post(
-            'https://api.submagic.co/v1/projects/upload',
-            headers={'x-api-key': key},
-            files={'file': ('video.mp4', f, 'video/mp4')},
-            data={
-                'title': f'AdMachine-{pid[:8]}',
-                'language': 'fr',
-                'templateName': template,
-                'magicZooms': 'true',
-            },
-            timeout=120
-        )
+    for i, word in enumerate(words):
+        start = i * tpw
+        end = min((i + 1) * tpw, total_duration)
+        text = word.upper()
+        is_highlight = (i % 5 == 2) or len(word) > 5
+        hl_idx = (i // 5) % len(COLORS)
+        style_name = f"HL{hl_idx}" if is_highlight else "Normal"
+        anim = r"{\t(0,80,\fscx115\fscy115)\t(80,160,\fscx100\fscy100)}"
+        lines.append(f"Dialogue: 0,{ts(start)},{ts(end)},{style_name},,0,0,0,,{anim}{text}")
 
-    print(f"  Submagic upload: {r.status_code} {r.text[:300]}")
-
-    if not r.ok:
-        return None
-
-    sm_id = r.json().get('id')
-    print(f"  Submagic project ID: {sm_id}")
-
-    # Déclencher l'export
-    exp = requests.post(
-        f'https://api.submagic.co/v1/projects/{sm_id}/export',
-        headers={'x-api-key': key, 'Content-Type': 'application/json'},
-        json={'width': 1080, 'height': 1920, 'fps': 30},
-        timeout=30
-    )
-    print(f"  Export triggered: {exp.status_code}")
-
-    # Polling jusqu'à 8 minutes
-    for i in range(96):
-        time.sleep(5)
-        check = requests.get(
-            f'https://api.submagic.co/v1/projects/{sm_id}',
-            headers={'x-api-key': key}, timeout=15
-        )
-        if check.ok:
-            proj = check.json()
-            status = proj.get('status')
-            direct_url = proj.get('directUrl') or proj.get('downloadUrl')
-            if i % 6 == 0:
-                print(f"  Submagic [{i+1}]: {status}")
-            if status == 'completed' and direct_url:
-                print(f"  ✅ Submagic done! {direct_url[:60]}")
-                return direct_url
-            elif status == 'failed':
-                reason = proj.get('failureReason', 'unknown')
-                print(f"  ❌ Submagic failed: {reason}")
-                return None
-
-    print(f"  ⏱️ Submagic timeout")
-    return None
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    print(f"  ASS captions: {len(words)} mots, style={style}")
 
 
 def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, sb):
@@ -203,13 +175,12 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
 
         if not clips_by_video: raise Exception("No clips extracted")
 
-        # 2. INTERLEAVE
+        # 2. INTERLEAVE + ASSEMBLER
         interleaved = interleave_clips(clips_by_video)
         needed = math.ceil(duration / 3.0)
         selected = [interleaved[i % len(interleaved)] for i in range(needed)]
-        print(f"  {len(selected)} clips interleaved: {[os.path.basename(c) for c in selected[:4]]}...")
+        print(f"  {len(selected)} clips interleaved")
 
-        # 3. ASSEMBLER
         concat = f"{tmp}/concat.txt"
         with open(concat, 'w') as f:
             for c in selected: f.write(f"file '{c}'\n")
@@ -227,7 +198,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                 try: os.remove(c)
                 except: pass
 
-        # 4. VOIX + MUSIQUE
+        # 3. VOIX + MUSIQUE
         voice_path = music_path = None
         if voice_url:
             try:
@@ -240,61 +211,63 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                 print("  music OK")
             except Exception as e: print(f"  music error: {e}")
 
-        # 5. MIXAGE FINAL
+        # 4. CAPTIONS ASS STYLE TIKTOK
+        ass_path = f"{tmp}/captions.ass"
+        words = [w for w in voiceover.replace('\n', ' ').split() if w]
+        make_ass(words, duration, ass_path, style)
+
+        ass_esc = ass_path.replace(':', '\\:')
+        ass_filter = f"ass={ass_esc}"
+
+        # 5. RENDU FINAL
         output = f"{tmp}/final.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
         n = 1
         if voice_path: cmd += ['-i', voice_path]; n += 1
         if music_path: cmd += ['-i', music_path]; n += 1
 
+        cmd += ['-vf', ass_filter]
+
         if n == 1:
-            # Pas d'audio
-            cmd += ['-c:v', 'copy', '-an']
+            cmd += ['-an']
         elif n == 2 and voice_path:
-            # Voix seule — copie directe sans filtre pour garder le volume original
             cmd += ['-map', '0:v', '-map', '1:a',
-                    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
-                    '-t', str(duration)]
+                    '-c:a', 'aac', '-b:a', '192k', '-t', str(duration)]
         elif n == 2 and music_path:
-            # Musique seule à 10%
             cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[a]',
-                    '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k']
+                    '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
         else:
-            # Voix + musique : voix à 100%, musique à 10%
             cmd += ['-filter_complex',
                     f'[1:a]asetpts=PTS-STARTPTS[v];'
                     f'[2:a]volume=0.10,asetpts=PTS-STARTPTS[m];'
                     f'[v][m]amix=inputs=2:duration=first:normalize=0[a]',
-                    '-map', '0:v', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k']
+                    '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
 
-        cmd += ['-t', str(duration), '-movflags', '+faststart', output]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        cmd += ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-movflags', '+faststart', '-r', '30', '-t', str(duration), output]
+
+        print("  Rendering with captions...")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=500)
         if res.returncode != 0:
-            raise Exception(f"FFmpeg mix: {res.stderr[-300:]}")
+            print("FFmpeg stderr:", res.stderr[-2000:])
+            raise Exception(f"FFmpeg: {res.stderr[-300:]}")
 
         size_mb = os.path.getsize(output) / 1024 / 1024
-        print(f"  mix OK ({size_mb:.1f}MB)")
+        print(f"  Render OK ({size_mb:.1f}MB)")
+
         try: os.remove(assembled)
         except: pass
 
-        # 6. SUBMAGIC — UPLOAD DIRECT + CAPTIONS PRO
-        final_url = submagic_upload_and_process(output, pid, style)
-
-        if final_url:
-            # Submagic a réussi
-            sb.update_video(pid, {'video_url': final_url})
-            sb.update_project(pid, {'status': 'done'})
-            return final_url
-
-        # Fallback — upload sur Supabase sans captions Submagic
-        print("  Fallback: uploading to Supabase...")
+        # 6. UPLOAD SUPABASE
         filename = f"renders/{pid}/final.mp4"
         with open(output, 'rb') as f: video_bytes = f.read()
         sb.upload('videos', filename, video_bytes)
-        raw_url = sb.public_url('videos', filename)
-        sb.update_video(pid, {'video_url': raw_url})
+        final_url = sb.public_url('videos', filename)
+
+        sb.update_video(pid, {'video_url': final_url})
         sb.update_project(pid, {'status': 'done'})
-        return raw_url
+        print(f"  Upload OK ✅")
+        return final_url
 
 
 if __name__ == '__main__':
