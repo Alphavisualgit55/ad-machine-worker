@@ -1,4 +1,4 @@
-import os, json, math, subprocess, tempfile, requests, traceback, threading, time, random
+import os, json, math, subprocess, tempfile, requests, traceback, threading, time, random, re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -7,8 +7,6 @@ CORS(app)
 
 SUBMAGIC_KEY = 'sk-65c7ec039cc99e9f86333a018e208550f8b4f9725dfe80e8a8d2103ad53aed0f'
 SUBMAGIC_URL = 'https://api.submagic.co/v1'
-
-# URL du film burn stocké sur Supabase
 FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
 
 @app.route('/', methods=['GET'])
@@ -64,7 +62,7 @@ def render():
     sb_key     = data.get('supabaseKey')
 
     if not pid or not video_urls:
-        return jsonify({'error': 'Données manquantes'}), 400
+        return jsonify({'error': 'Donnees manquantes'}), 400
 
     def run():
         sb = SB(sb_url, sb_key)
@@ -104,145 +102,120 @@ def interleave_clips(clips_by_video):
 
 
 def apply_vfx(video_path, tmp, duration, film_burn_path):
-    """
-    Applique les VFX sur la vidéo :
-    - Film burns (fond noir → blend screen) à 2-3 moments aléatoires
-    - Glitch effect (rgb split) entre les burns
-    - Effets sonores synchronisés
-    """
-    if not film_burn_path or not os.path.exists(film_burn_path):
-        print("  VFX: no film burn file, skipping")
-        return video_path
+    """Film burns avec blend lighten (supprime fond noir) + glitch + sons"""
+    try:
+        burn_dur = min(get_dur(film_burn_path), 2.0)
+        output = f"{tmp}/vfx.mp4"
 
-    burn_dur = get_dur(film_burn_path)
-    output = f"{tmp}/vfx.mp4"
+        margin = max(2.0, duration * 0.15)
+        n_burns = random.randint(2, 3)
+        positions = []
+        attempts = 0
+        while len(positions) < n_burns and attempts < 100:
+            t = round(random.uniform(margin, duration - margin - burn_dur), 1)
+            if all(abs(t - p) > 4.0 for p in positions):
+                positions.append(t)
+            attempts += 1
+        positions.sort()
+        print(f"  VFX burns at: {positions}s")
 
-    # Positions aléatoires — 2 à 3 burns bien espacés
-    margin = max(2.0, duration * 0.15)
-    n_burns = random.randint(2, 3)
-    
-    # Générer des positions espacées d'au moins 4 secondes
-    positions = []
-    attempts = 0
-    while len(positions) < n_burns and attempts < 100:
-        t = round(random.uniform(margin, duration - margin - burn_dur), 1)
-        if all(abs(t - p) > 4.0 for p in positions):
-            positions.append(t)
-        attempts += 1
-    positions.sort()
-    print(f"  VFX burns at: {positions}s")
+        # Préparer le film burn en bonne résolution
+        burn_prep = f"{tmp}/burn_prep.mp4"
+        r = subprocess.run([
+            'ffmpeg', '-y', '-i', film_burn_path,
+            '-t', str(burn_dur),
+            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+            '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast',
+            burn_prep
+        ], capture_output=True)
+        if r.returncode != 0:
+            print("  VFX burn prep error")
+            return video_path
 
-    # ===== ÉTAPE 1 : Overlay film burns (blend screen sur fond noir) =====
-    burn_dur_safe = min(burn_dur, 2.0)
-    
-    # Construire filter_complex pour les burns
-    # Fond noir → le mode "screen" rend le noir transparent naturellement
-    fc_parts = []
-    fc_parts.append(f'[1:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[burn_base]')
-    
-    prev = '[0:v]'
-    for i, t in enumerate(positions):
-        next_label = f'[v{i}]' if i < len(positions) - 1 else '[vburn]'
-        # Loop le film burn si nécessaire et l'appliquer avec blend screen
-        fc_parts.append(
-            f'[burn_base]trim=0:{burn_dur_safe},setpts=PTS-STARTPTS[b{i}];'
-            f'{prev}[b{i}]overlay=0:0:enable=\'between(t,{t},{t+burn_dur_safe})\''
-            f':format=auto{next_label}'
-        )
-        prev = next_label
-
-    # ===== ÉTAPE 2 : Glitch RGB split entre les burns =====
-    # Appliquer glitch léger à des moments différents des burns
-    glitch_times = []
-    for t in positions:
-        g = t + burn_dur_safe + 0.5
-        if g + 0.3 < duration:
-            glitch_times.append(round(g, 1))
-
-    if glitch_times:
-        glitch_filters = []
-        for gt in glitch_times:
-            # Split RGB : décaler légèrement les canaux rouge et bleu
-            glitch_filters.append(
-                f"split=3[r{int(gt*10)}][g{int(gt*10)}][b{int(gt*10)}];"
-            )
-        # Approche simple : drawbox coloré rapide pour simuler glitch
-        glitch_vf = ','.join([
-            f"drawbox=x=0:y=0:w=iw:h=4:color=00FFFF@0.8:t=fill:enable='between(t,{gt},{gt+0.05})',"
-            f"drawbox=x=0:y=ih-4:w=iw:h=4:color=FF00FF@0.8:t=fill:enable='between(t,{gt+0.05},{gt+0.10})'"
-            for gt in glitch_times
-        ])
-        
-        # Ajouter glitch après les burns
-        fc_parts.append(f'[vburn]{glitch_vf}[vout]')
-    else:
-        fc_parts.append('[vburn]null[vout]')
-
-    filter_complex = ';'.join(fc_parts)
-
-    # ===== ÉTAPE 3 : Extraire l'audio du film burn pour les effets sonores =====
-    burn_audio = f"{tmp}/burn_audio.wav"
-    subprocess.run([
-        'ffmpeg', '-y', '-i', film_burn_path,
-        '-t', str(burn_dur_safe),
-        '-vn', '-c:a', 'pcm_s16le', burn_audio
-    ], capture_output=True)
-
-    has_burn_audio = os.path.exists(burn_audio)
-
-    # ===== ÉTAPE 4 : Rendu final avec VFX =====
-    cmd = ['ffmpeg', '-y', '-i', video_path, '-i', film_burn_path]
-    audio_inputs = 1  # video_path audio
-
-    if has_burn_audio:
-        # Ajouter les sons burn aux bons moments
-        burn_sound_parts = []
+        # Construire le filter_complex
+        # blend lighten : garde pixel le plus lumineux → fond noir devient transparent
+        fc_parts = []
         for i, t in enumerate(positions):
-            delay_ms = int(t * 1000)
-            burn_sound_parts.append(f'[{2+i}:a]adelay={delay_ms}|{delay_ms}[bs{i}]')
-            cmd += ['-i', burn_audio]
-            audio_inputs += 1
+            t2 = round(t + burn_dur, 2)
+            in_label = f'[tmp{i-1}]' if i > 0 else '[0:v]'
+            out_label = f'[tmp{i}]' if i < len(positions) - 1 else '[vburn]'
+            part = f"{in_label}[{i+1}:v]blend=all_mode=lighten:all_opacity=0.9:enable='between(t,{t},{t2})'{out_label}"
+            fc_parts.append(part)
 
-        n_extra = len(positions)
-        mix_inputs = '[1:a]' + ''.join(f'[bs{i}]' for i in range(n_extra))
-        # Note: [1:a] = audio du film burn original (ignoré), on utilise les copies décalées
-        burn_sound_parts.append(
-            f'[0:a]' + ''.join(f'[bs{i}]' for i in range(n_extra)) +
-            f'amix=inputs={n_extra+1}:duration=first:normalize=0[aout]'
-        )
-        full_fc = filter_complex + ';' + ';'.join(burn_sound_parts)
-        
-        res = subprocess.run([
-            *cmd,
-            '-filter_complex', full_fc,
-            '-map', '[vout]', '-map', '[aout]',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-            '-c:a', 'aac', '-b:a', '192k',
-            '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
-        ], capture_output=True, text=True, timeout=300)
-    else:
-        res = subprocess.run([
-            *cmd,
-            '-filter_complex', filter_complex,
-            '-map', '[vout]', '-map', '0:a',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-            '-c:a', 'copy',
-            '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
-        ], capture_output=True, text=True, timeout=300)
+        # Glitch RGB après chaque burn
+        glitch_parts = []
+        for t in positions:
+            gt = round(t + burn_dur + 0.2, 1)
+            gt2 = round(gt + 0.06, 2)
+            gt3 = round(gt + 0.12, 2)
+            if gt3 < duration:
+                glitch_parts.append(f"hue=h=180:enable='between(t,{gt},{gt2})'")
+                glitch_parts.append(f"hue=h=0:enable='between(t,{gt2},{gt3})'")
 
-    if res.returncode != 0:
-        print(f"  VFX error: {res.stderr[-400:]}")
+        if glitch_parts:
+            fc_parts.append(f'[vburn]{",".join(glitch_parts)}[vout]')
+        else:
+            fc_parts.append('[vburn]copy[vout]')
+
+        filter_complex = ';'.join(fc_parts)
+
+        # Extraire audio burns
+        burn_audio = f"{tmp}/burn_audio.wav"
+        subprocess.run([
+            'ffmpeg', '-y', '-i', film_burn_path,
+            '-t', str(burn_dur), '-vn', '-c:a', 'pcm_s16le', burn_audio
+        ], capture_output=True)
+        has_audio = os.path.exists(burn_audio) and os.path.getsize(burn_audio) > 1000
+
+        cmd = ['ffmpeg', '-y', '-i', video_path]
+        for _ in positions:
+            cmd += ['-i', burn_prep]
+
+        if has_audio:
+            sp = []
+            offset = len(positions) + 1
+            for i, t in enumerate(positions):
+                cmd += ['-i', burn_audio]
+                delay_ms = int(t * 1000)
+                sp.append(f'[{offset+i}:a]adelay={delay_ms}|{delay_ms}[bs{i}]')
+            n = len(positions)
+            mix = ''.join(f'[bs{i}]' for i in range(n))
+            sp.append(f'[0:a]{mix}amix=inputs={n+1}:duration=first:normalize=0[aout]')
+            full_fc = filter_complex + ';' + ';'.join(sp)
+            cmd += [
+                '-filter_complex', full_fc,
+                '-map', '[vout]', '-map', '[aout]',
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
+            ]
+        else:
+            cmd += [
+                '-filter_complex', filter_complex,
+                '-map', '[vout]', '-map', '0:a',
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-c:a', 'copy',
+                '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
+            ]
+
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            print(f"  VFX error: {res.stderr[-300:]}")
+            return video_path
+
+        print("  VFX applied")
+        return output
+
+    except Exception as e:
+        print(f"  VFX exception (skipping): {e}")
         return video_path
-
-    print(f"  VFX applied ✅ ({os.path.getsize(output)/1024/1024:.1f}MB)")
-    return output
 
 
 def submagic_process(video_path, pid, template):
     headers_sm = {'x-api-key': SUBMAGIC_KEY}
-    valid = ['Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
-             'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
-             'Daniel','Dan','Devin','Tayo','Jason','Noah']
+    valid = ['Hormozi 2', 'Hormozi 1', 'Hormozi 3', 'Hormozi 4', 'Hormozi 5',
+             'Beast', 'Sara', 'Karl', 'Ella', 'Matt', 'Jess', 'Nick', 'Laura',
+             'Daniel', 'Dan', 'Devin', 'Tayo', 'Jason', 'Noah']
     if template not in valid:
         template = 'Hormozi 2'
 
@@ -253,8 +226,13 @@ def submagic_process(video_path, pid, template):
                 f'{SUBMAGIC_URL}/projects/upload',
                 headers=headers_sm,
                 files={'file': ('video.mp4', f, 'video/mp4')},
-                data={'title': f'AdMachine-{pid[:8]}', 'language': 'fr',
-                      'templateName': template, 'magicZooms': 'true'},
+                data={
+                    'title': f'AdMachine-{pid[:8]}',
+                    'language': 'fr',
+                    'templateName': template,
+                    'magicZooms': 'true',
+                    'removeSilencePace': 'natural',
+                },
                 timeout=180
             )
     except Exception as e:
@@ -278,9 +256,11 @@ def submagic_process(video_path, pid, template):
         if status == 'failed': return None
         if trans == 'COMPLETED': break
 
-    exp = requests.post(f'{SUBMAGIC_URL}/projects/{sm_id}/export',
+    exp = requests.post(
+        f'{SUBMAGIC_URL}/projects/{sm_id}/export',
         headers={**headers_sm, 'Content-Type': 'application/json'},
-        json={'width': 1080, 'height': 1920, 'fps': 30}, timeout=30)
+        json={'width': 1080, 'height': 1920, 'fps': 30}, timeout=30
+    )
     print(f"  [SM] Export: {exp.status_code}")
     if not exp.ok: return None
 
@@ -299,7 +279,7 @@ def submagic_process(video_path, pid, template):
             print(f"  [SM] Failed: {proj.get('failureReason')}")
             return None
 
-    print(f"  [SM] Timeout")
+    print("  [SM] Timeout")
     return None
 
 
@@ -356,7 +336,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
             '-t', str(duration), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-r', '30',
             assembled
         ], check=True, capture_output=True)
-        print(f"  assembled OK")
+        print("  assembled OK")
 
         for clips in clips_by_video:
             for c in clips:
@@ -408,19 +388,19 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         try: os.remove(assembled)
         except: pass
 
-        # 5. VFX — Film burns + glitch (si activé par l'utilisateur)
+        # 5. VFX
         if vfx and FILM_BURN_URL:
-            film_burn_path = f"{tmp}/film_burn.mp4"
             try:
+                film_burn_path = f"{tmp}/film_burn.mp4"
                 dl(FILM_BURN_URL, film_burn_path)
-                print("  Film burn downloaded ✅")
+                print("  Film burn downloaded")
                 output = apply_vfx(output, tmp, duration, film_burn_path)
             except Exception as e:
-                print(f"  VFX download error: {e}")
+                print(f"  VFX error (skipping): {e}")
         elif vfx:
-            print("  VFX requested but FILM_BURN_URL not set")
+            print("  VFX skipped: FILM_BURN_URL not set")
 
-        # 6. SUBMAGIC — captions pro
+        # 6. SUBMAGIC
         final_url = submagic_process(output, pid, style)
 
         if final_url:
@@ -436,7 +416,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         final_url = sb.public_url('videos', filename)
         sb.update_video(pid, {'video_url': final_url})
         sb.update_project(pid, {'status': 'done'})
-        print(f"  Upload OK")
+        print("  Upload OK")
         return final_url
 
 
