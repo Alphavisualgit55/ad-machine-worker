@@ -104,41 +104,31 @@ def interleave_clips(clips_by_video):
 
 def add_watermark(video_path, tmp, duration, is_free):
     """
-    Filigrane permanent gravé dans la vidéo — impossible à supprimer.
-    Plan gratuit : grand filigrane centré en diagonale
-    Plan payant : petit filigrane discret en bas à droite
+    Filigrane uniquement pour le plan gratuit.
+    Plan payant : aucun filigrane.
     """
+    if not is_free:
+        print("  Watermark skipped (paid plan)")
+        return video_path
+
     output = f"{tmp}/watermarked.mp4"
 
-    if is_free:
-        # Filigrane grand centré en diagonale — plan gratuit
-        wm_filter = (
-            "drawtext=text='AD MACHINE':"
-            "fontsize=72:"
-            "fontcolor=white@0.35:"
-            "x=(w-text_w)/2:"
-            "y=(h-text_h)/2:"
-            "angle=-0.52:"  # ~30 degrés en radians
-            "fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf,"
-            # Deuxième couche décalée pour effet
-            "drawtext=text='AD MACHINE':"
-            "fontsize=72:"
-            "fontcolor=white@0.15:"
-            "x=(w-text_w)/2+4:"
-            "y=(h-text_h)/2+4:"
-            "angle=-0.52:"
-            "fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        )
-    else:
-        # Filigrane petit discret en bas à droite — plan payant
-        wm_filter = (
-            "drawtext=text='Ad Machine':"
-            "fontsize=24:"
-            "fontcolor=white@0.50:"
-            "x=w-text_w-20:"
-            "y=h-text_h-30:"
-            "fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        )
+    wm_filter = (
+        "drawtext=text='AD MACHINE':"
+        "fontsize=72:"
+        "fontcolor=white@0.35:"
+        "x=(w-text_w)/2:"
+        "y=(h-text_h)/2:"
+        "angle=-0.52:"
+        "fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf,"
+        "drawtext=text='AD MACHINE':"
+        "fontsize=72:"
+        "fontcolor=white@0.15:"
+        "x=(w-text_w)/2+4:"
+        "y=(h-text_h)/2+4:"
+        "angle=-0.52:"
+        "fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    )
 
     res = subprocess.run([
         'ffmpeg', '-y', '-i', video_path,
@@ -152,7 +142,7 @@ def add_watermark(video_path, tmp, duration, is_free):
         print(f"  Watermark error: {res.stderr[-200:]}")
         return video_path
 
-    print(f"  Watermark added ({'free' if is_free else 'paid'}) OK")
+    print("  Watermark added (free plan) OK")
     return output
 
 
@@ -460,10 +450,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         try: os.remove(assembled)
         except: pass
 
-        # 5. FILIGRANE PERMANENT (gravé dans la vidéo)
-        output = add_watermark(output, tmp, duration, is_free)
-
-        # 6. VFX (optionnel)
+        # 5. VFX (optionnel)
         if vfx and FILM_BURN_URL:
             try:
                 film_burn_path = f"{tmp}/film_burn.mp4"
@@ -474,6 +461,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 print(f"  VFX error (skipping): {e}")
         elif vfx:
             print("  VFX skipped: FILM_BURN_URL not set")
+
+        # 6. FILIGRANE PERMANENT — gravé avant Submagic
+        # Comme ça le filigrane est présent même sur la vidéo Submagic téléchargée
+        output = add_watermark(output, tmp, duration, is_free)
 
         # 7. SUBMAGIC
         final_url = submagic_process(output, pid, style)
