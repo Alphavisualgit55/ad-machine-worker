@@ -9,7 +9,7 @@ SUBMAGIC_KEY = 'sk-65c7ec039cc99e9f86333a018e208550f8b4f9725dfe80e8a8d2103ad53ae
 SUBMAGIC_URL = 'https://api.submagic.co/v1'
 
 # URL du film burn stocké sur Supabase
-FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
+FILM_BURN_URL = os.environ.get('https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/assets/film_burn.mp4', '')
 
 @app.route('/', methods=['GET'])
 def index():
