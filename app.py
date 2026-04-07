@@ -1,4 +1,4 @@
-import os, json, math, subprocess, tempfile, requests, traceback, threading, time
+import os, json, math, subprocess, tempfile, requests, traceback, threading, time, random
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -99,84 +99,162 @@ def interleave_clips(clips_by_video):
     return result
 
 
-def submagic_process(video_path, pid, template):
+def add_film_burns(video_path, tmp, duration):
     """
-    Flow exact Submagic :
-    1. Upload fichier → obtenir project ID
-    2. Attendre transcriptionStatus = COMPLETED
-    3. Déclencher export
-    4. Poll jusqu'à status = completed
-    5. Retourner directUrl
+    Ajoute 2-3 effets film burn orange/rouge à des moments aléatoires.
+    Flash rapide de 0.4s qui donne l'effet cinématique.
     """
-    headers_sm = {'x-api-key': SUBMAGIC_KEY}
+    output = f"{tmp}/with_burns.mp4"
 
-    # Templates valides Submagic (depuis la doc)
-    valid_templates = ['Hormozi 2', 'Hormozi 1', 'Hormozi 3', 'Hormozi 4', 'Hormozi 5',
-                       'Beast', 'Sara', 'Karl', 'Ella', 'Matt', 'Jess', 'Nick',
-                       'Laura', 'Daniel', 'Dan', 'Devin', 'Tayo', 'Jason', 'Noah']
-    if template not in valid_templates:
+    # Positions aléatoires — éviter début et fin
+    margin = max(2, int(duration * 0.15))
+    num_burns = random.randint(2, 3)
+    positions = sorted(random.sample(range(margin * 10, (duration - margin) * 10), min(num_burns, (duration - 2 * margin) * 10 - 1)))
+    burn_times = [p / 10.0 for p in positions[:num_burns]]
+    print(f"  Film burns at: {burn_times}s")
+
+    # Construire le filtre drawbox pour chaque burn
+    # Phase 1 (0→0.15s): flash orange intense
+    # Phase 2 (0.15→0.30s): orange moyen
+    # Phase 3 (0.30→0.40s): orange léger fade out
+    filters = []
+    for t in burn_times:
+        t1, t2, t3, t4 = round(t, 2), round(t + 0.15, 2), round(t + 0.30, 2), round(t + 0.40, 2)
+        filters += [
+            f"drawbox=x=0:y=0:w=iw:h=ih:color=FF4400@0.75:t=fill:enable='between(t,{t1},{t2})'",
+            f"drawbox=x=0:y=0:w=iw:h=ih:color=FF6600@0.50:t=fill:enable='between(t,{t2},{t3})'",
+            f"drawbox=x=0:y=0:w=iw:h=ih:color=FFAA00@0.25:t=fill:enable='between(t,{t3},{t4})'",
+        ]
+
+    vf = ','.join(filters)
+
+    res = subprocess.run([
+        'ffmpeg', '-y', '-i', video_path,
+        '-vf', vf,
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-c:a', 'copy', '-t', str(duration), output
+    ], capture_output=True, text=True, timeout=120)
+
+    if res.returncode != 0:
+        print(f"  Film burn error: {res.stderr[-200:]}")
+        return video_path, burn_times
+
+    print(f"  Film burns added ✅")
+    return output, burn_times
+
+
+def add_whoosh_sounds(video_path, tmp, burn_times, duration):
+    """
+    Ajoute un son whoosh/scratch à chaque film burn.
+    Généré avec FFmpeg sine + echo pour effet cinématique.
+    """
+    if not burn_times:
+        return video_path
+
+    output = f"{tmp}/with_whoosh.mp4"
+
+    # Générer chaque son whoosh
+    sound_inputs = []
+    delays = []
+    for i, t in enumerate(burn_times):
+        sound_path = f"{tmp}/whoosh_{i}.wav"
+        r = subprocess.run([
+            'ffmpeg', '-y',
+            '-f', 'lavfi',
+            '-i', 'sine=frequency=300:duration=0.35',
+            '-af', (
+                'afade=t=in:st=0:d=0.02,'
+                'afade=t=out:st=0.25:d=0.10,'
+                'aecho=0.6:0.4:40:0.3,'
+                'volume=0.7'
+            ),
+            sound_path
+        ], capture_output=True)
+        if r.returncode == 0:
+            sound_inputs.append(sound_path)
+            delays.append(int(t * 1000))
+
+    if not sound_inputs:
+        return video_path
+
+    # Mixer les sons avec la vidéo
+    cmd = ['ffmpeg', '-y', '-i', video_path]
+    for s in sound_inputs:
+        cmd += ['-i', s]
+
+    n = len(sound_inputs)
+    fc_parts = []
+    for i, d in enumerate(delays):
+        fc_parts.append(f'[{i+1}:a]adelay={d}|{d}[w{i}]')
+
+    mix_in = ''.join(f'[w{i}]' for i in range(n))
+    fc_parts.append(f'[0:a]{mix_in}amix=inputs={n+1}:duration=first:normalize=0[aout]')
+
+    res = subprocess.run([
+        *cmd,
+        '-filter_complex', ';'.join(fc_parts),
+        '-map', '0:v', '-map', '[aout]',
+        '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+        '-t', str(duration), output
+    ], capture_output=True, text=True, timeout=60)
+
+    if res.returncode != 0:
+        print(f"  Whoosh error: {res.stderr[-200:]}")
+        return video_path
+
+    print(f"  Whoosh sounds added ✅")
+    return output
+
+
+def submagic_process(video_path, pid, template):
+    headers_sm = {'x-api-key': SUBMAGIC_KEY}
+    valid = ['Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
+             'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
+             'Daniel','Dan','Devin','Tayo','Jason','Noah']
+    if template not in valid:
         template = 'Hormozi 2'
 
-    print(f"  [SM] Upload → template={template}")
-
-    # 1. UPLOAD FICHIER
+    print(f"  [SM] Upload template={template}")
     try:
         with open(video_path, 'rb') as f:
             resp = requests.post(
                 f'{SUBMAGIC_URL}/projects/upload',
                 headers=headers_sm,
                 files={'file': ('video.mp4', f, 'video/mp4')},
-                data={
-                    'title': f'AdMachine-{pid[:8]}',
-                    'language': 'fr',
-                    'templateName': template,
-                    'magicZooms': 'true',
-                },
+                data={'title': f'AdMachine-{pid[:8]}', 'language': 'fr',
+                      'templateName': template, 'magicZooms': 'true'},
                 timeout=180
             )
     except Exception as e:
-        print(f"  [SM] Upload error: {e}")
+        print(f"  [SM] Error: {e}")
         return None
 
-    print(f"  [SM] Upload: {resp.status_code} {resp.text[:200]}")
-    if not resp.ok:
-        return None
+    print(f"  [SM] Upload: {resp.status_code} {resp.text[:150]}")
+    if not resp.ok: return None
 
     sm_id = resp.json().get('id')
-    print(f"  [SM] Project: {sm_id}")
+    print(f"  [SM] ID: {sm_id}")
 
-    # 2. ATTENDRE TRANSCRIPTION
-    print(f"  [SM] Waiting transcription...")
+    # Attendre transcription
     for i in range(60):
         time.sleep(5)
         r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
         if not r.ok: continue
         proj = r.json()
         status = proj.get('status')
-        transcription = proj.get('transcriptionStatus')
-        print(f"  [SM] [{i+1}] status={status} trans={transcription}")
-        if status == 'failed':
-            print(f"  [SM] Failed: {proj.get('failureReason')}")
-            return None
-        if transcription == 'COMPLETED':
-            print(f"  [SM] Transcription OK")
-            break
+        trans = proj.get('transcriptionStatus')
+        print(f"  [SM] [{i+1}] {status} / {trans}")
+        if status == 'failed': return None
+        if trans == 'COMPLETED': break
 
-    # 3. DÉCLENCHER EXPORT
-    print(f"  [SM] Triggering export...")
-    exp = requests.post(
-        f'{SUBMAGIC_URL}/projects/{sm_id}/export',
+    # Export
+    exp = requests.post(f'{SUBMAGIC_URL}/projects/{sm_id}/export',
         headers={**headers_sm, 'Content-Type': 'application/json'},
-        json={'width': 1080, 'height': 1920, 'fps': 30},
-        timeout=30
-    )
+        json={'width': 1080, 'height': 1920, 'fps': 30}, timeout=30)
     print(f"  [SM] Export: {exp.status_code}")
-    if not exp.ok:
-        print(f"  [SM] Export error: {exp.text[:100]}")
-        return None
+    if not exp.ok: return None
 
-    # 4. POLL JUSQU'À COMPLETED
-    print(f"  [SM] Polling...")
+    # Poll
     for i in range(120):
         time.sleep(5)
         r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
@@ -203,7 +281,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         clips_needed = math.ceil(duration / 3.0) + 2
         clips_per_video = math.ceil(clips_needed / max(len(video_urls), 1)) + 2
 
-        # 1. TÉLÉCHARGER ET EXTRAIRE CLIPS EN ALTERNANT
+        # 1. TÉLÉCHARGER ET EXTRAIRE CLIPS
         clips_by_video = []
         for i, url in enumerate(video_urls[:8]):
             src = f"{tmp}/src_{i}.mp4"
@@ -216,13 +294,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                 while start + 1.5 <= src_dur and c_idx < clips_per_video:
                     out = f"{tmp}/v{i}_c{c_idx:03d}.mp4"
                     cd = min(3.0, src_dur - start)
-                    # Filtre qualité : scale + unsharp pour netteté
-                    vf = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,unsharp=5:5:0.8:3:3:0.4'
                     r = subprocess.run([
                         'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
-                        '-vf', vf, '-r', '30',
-                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
-                        '-an', out
+                        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,unsharp=5:5:0.8:3:3:0.4',
+                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-an', out
                     ], capture_output=True)
                     if r.returncode == 0: clips.append(out)
                     c_idx += 1; start += 3.0
@@ -236,13 +311,12 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
 
         if not clips_by_video: raise Exception("No clips extracted")
 
-        # 2. INTERLEAVE + ASSEMBLER AVEC TRANSITIONS XFADE
+        # 2. INTERLEAVE + ASSEMBLER
         interleaved = interleave_clips(clips_by_video)
         needed = math.ceil(duration / 3.0)
         selected = [interleaved[i % len(interleaved)] for i in range(needed)]
         print(f"  {len(selected)} clips interleaved")
 
-        # Assembler avec concat simple (xfade trop complexe pour ultrafast)
         concat = f"{tmp}/concat.txt"
         with open(concat, 'w') as f:
             for c in selected: f.write(f"file '{c}'\n")
@@ -250,8 +324,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         assembled = f"{tmp}/assembled.mp4"
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
-            '-t', str(duration),
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-r', '30',
+            '-t', str(duration), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-r', '30',
             assembled
         ], check=True, capture_output=True)
         print(f"  assembled OK")
@@ -274,7 +347,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
                 print("  music OK")
             except Exception as e: print(f"  music error: {e}")
 
-        # 4. MIXAGE FINAL HAUTE QUALITÉ
+        # 4. MIXAGE
         output = f"{tmp}/final.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
         n = 1
@@ -284,25 +357,18 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         if n == 1:
             cmd += ['-an']
         elif n == 2 and voice_path:
-            cmd += ['-map', '0:v', '-map', '1:a',
-                    '-c:a', 'aac', '-b:a', '192k', '-t', str(duration)]
+            cmd += ['-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-t', str(duration)]
         elif n == 2 and music_path:
             cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
         else:
             cmd += ['-filter_complex',
-                    f'[1:a]asetpts=PTS-STARTPTS[v];'
-                    f'[2:a]volume=0.10,asetpts=PTS-STARTPTS[m];'
+                    f'[1:a]asetpts=PTS-STARTPTS[v];[2:a]volume=0.10,asetpts=PTS-STARTPTS[m];'
                     f'[v][m]amix=inputs=2:duration=first:normalize=0[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
 
-        # Filtre vidéo final : contraste + saturation + netteté
-        video_filter = 'eq=contrast=1.05:saturation=1.15:brightness=0.02,unsharp=3:3:0.5'
-        cmd += [
-            '-vf', video_filter,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
-            '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
-        ]
+        cmd += ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-movflags', '+faststart', '-r', '30', '-t', str(duration), output]
 
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if res.returncode != 0:
@@ -313,7 +379,11 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, s
         try: os.remove(assembled)
         except: pass
 
-        # 5. SUBMAGIC — captions pro + transitions + effets sonores
+        # 5. FILM BURNS + WHOOSH SOUNDS
+        output, burn_times = add_film_burns(output, tmp, duration)
+        output = add_whoosh_sounds(output, tmp, burn_times, duration)
+
+        # 6. SUBMAGIC — captions pro
         final_url = submagic_process(output, pid, style)
 
         if final_url:
