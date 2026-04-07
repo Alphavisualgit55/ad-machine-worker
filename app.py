@@ -1,4 +1,4 @@
-import os, json, math, subprocess, tempfile, requests, traceback, threading, time, random, re
+import os, json, math, subprocess, tempfile, requests, traceback, threading, time, random
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -58,6 +58,7 @@ def render():
     duration   = int(data.get('duration', 30))
     style      = data.get('captionStyle', 'Hormozi 2')
     vfx        = data.get('vfx', False)
+    is_free    = data.get('isFree', True)
     sb_url     = data.get('supabaseUrl')
     sb_key     = data.get('supabaseKey')
 
@@ -67,8 +68,8 @@ def render():
     def run():
         sb = SB(sb_url, sb_key)
         try:
-            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, sb)
-            print(f"[{pid}] DONE: {url[:60]}")
+            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, sb)
+            print(f"[{pid}] DONE")
         except Exception as e:
             traceback.print_exc()
             print(f"[{pid}] ERROR: {e}")
@@ -101,8 +102,67 @@ def interleave_clips(clips_by_video):
     return result
 
 
+def add_watermark(video_path, tmp, duration, is_free):
+    """
+    Filigrane permanent gravé dans la vidéo — impossible à supprimer.
+    Plan gratuit : grand filigrane centré en diagonale
+    Plan payant : petit filigrane discret en bas à droite
+    """
+    output = f"{tmp}/watermarked.mp4"
+
+    if is_free:
+        # Filigrane grand centré en diagonale — plan gratuit
+        wm_filter = (
+            "drawtext=text='AD MACHINE':"
+            "fontsize=72:"
+            "fontcolor=white@0.35:"
+            "x=(w-text_w)/2:"
+            "y=(h-text_h)/2:"
+            "angle=-0.52:"  # ~30 degrés en radians
+            "fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf,"
+            # Deuxième couche décalée pour effet
+            "drawtext=text='AD MACHINE':"
+            "fontsize=72:"
+            "fontcolor=white@0.15:"
+            "x=(w-text_w)/2+4:"
+            "y=(h-text_h)/2+4:"
+            "angle=-0.52:"
+            "fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        )
+    else:
+        # Filigrane petit discret en bas à droite — plan payant
+        wm_filter = (
+            "drawtext=text='Ad Machine':"
+            "fontsize=24:"
+            "fontcolor=white@0.50:"
+            "x=w-text_w-20:"
+            "y=h-text_h-30:"
+            "fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        )
+
+    res = subprocess.run([
+        'ffmpeg', '-y', '-i', video_path,
+        '-vf', wm_filter,
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-c:a', 'copy',
+        '-movflags', '+faststart', '-t', str(duration), output
+    ], capture_output=True, text=True, timeout=120)
+
+    if res.returncode != 0:
+        print(f"  Watermark error: {res.stderr[-200:]}")
+        return video_path
+
+    print(f"  Watermark added ({'free' if is_free else 'paid'}) OK")
+    return output
+
+
 def apply_vfx(video_path, tmp, duration, film_burn_path):
-    """Film burns avec blend lighten (supprime fond noir) + glitch + sons"""
+    """
+    Film burn : prend la partie GAUCHE de l'effet, agrandie en plein écran
+    Overlay en mode screen à opacité 100%
+    + Glitch RGB après chaque burn
+    + Sons synchronisés
+    """
     try:
         burn_dur = min(get_dur(film_burn_path), 2.0)
         output = f"{tmp}/vfx.mp4"
@@ -119,47 +179,59 @@ def apply_vfx(video_path, tmp, duration, film_burn_path):
         positions.sort()
         print(f"  VFX burns at: {positions}s")
 
-        # Préparer le film burn en bonne résolution
+        # Préparer le film burn :
+        # 1. Prendre la moitié gauche (crop w/2:h:0:0)
+        # 2. Agrandir en plein écran 1080x1920
+        # 3. Mode screen pour rendre le noir transparent
         burn_prep = f"{tmp}/burn_prep.mp4"
         r = subprocess.run([
             'ffmpeg', '-y', '-i', film_burn_path,
             '-t', str(burn_dur),
-            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-            '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast',
+            '-vf', (
+                'crop=iw/2:ih:0:0,'             # Partie gauche seulement
+                'scale=1080:1920:force_original_aspect_ratio=increase,'
+                'crop=1080:1920'                 # Centrer après scale
+            ),
+            '-pix_fmt', 'yuv420p',
+            '-c:v', 'libx264', '-preset', 'ultrafast',
             burn_prep
         ], capture_output=True)
+
         if r.returncode != 0:
             print("  VFX burn prep error")
             return video_path
 
-        # Construire le filter_complex
-        # blend lighten : garde pixel le plus lumineux → fond noir devient transparent
+        # Construire filter_complex
+        # blend=screen à 100% : les pixels noirs disparaissent, les pixels clairs s'ajoutent
         fc_parts = []
         for i, t in enumerate(positions):
             t2 = round(t + burn_dur, 2)
             in_label = f'[tmp{i-1}]' if i > 0 else '[0:v]'
             out_label = f'[tmp{i}]' if i < len(positions) - 1 else '[vburn]'
-            part = f"{in_label}[{i+1}:v]blend=all_mode=lighten:all_opacity=0.9:enable='between(t,{t},{t2})'{out_label}"
+            part = (
+                f"{in_label}[{i+1}:v]"
+                f"blend=all_mode=screen:all_opacity=1.0:"
+                f"enable='between(t,{t},{t2})'"
+                f"{out_label}"
+            )
             fc_parts.append(part)
 
-        # Glitch RGB après chaque burn
-        glitch_parts = []
+        # Glitch après chaque burn
+        glitch = []
         for t in positions:
-            gt = round(t + burn_dur + 0.2, 1)
-            gt2 = round(gt + 0.06, 2)
-            gt3 = round(gt + 0.12, 2)
-            if gt3 < duration:
-                glitch_parts.append(f"hue=h=180:enable='between(t,{gt},{gt2})'")
-                glitch_parts.append(f"hue=h=0:enable='between(t,{gt2},{gt3})'")
+            gt = round(t + burn_dur + 0.15, 1)
+            gt2 = round(gt + 0.08, 2)
+            if gt2 < duration:
+                glitch.append(f"hue=h=180:enable='between(t,{gt},{gt2})'")
 
-        if glitch_parts:
-            fc_parts.append(f'[vburn]{",".join(glitch_parts)}[vout]')
+        if glitch:
+            fc_parts.append(f'[vburn]{",".join(glitch)}[vout]')
         else:
             fc_parts.append('[vburn]copy[vout]')
 
         filter_complex = ';'.join(fc_parts)
 
-        # Extraire audio burns
+        # Extraire audio burns pour effets sonores
         burn_audio = f"{tmp}/burn_audio.wav"
         subprocess.run([
             'ffmpeg', '-y', '-i', film_burn_path,
@@ -203,7 +275,7 @@ def apply_vfx(video_path, tmp, duration, film_burn_path):
             print(f"  VFX error: {res.stderr[-300:]}")
             return video_path
 
-        print("  VFX applied")
+        print("  VFX applied OK")
         return output
 
     except Exception as e:
@@ -239,7 +311,7 @@ def submagic_process(video_path, pid, template):
         print(f"  [SM] Error: {e}")
         return None
 
-    print(f"  [SM] Upload: {resp.status_code} {resp.text[:150]}")
+    print(f"  [SM] Upload: {resp.status_code}")
     if not resp.ok: return None
 
     sm_id = resp.json().get('id')
@@ -273,7 +345,7 @@ def submagic_process(video_path, pid, template):
         url = proj.get('directUrl') or proj.get('downloadUrl')
         if i % 6 == 0: print(f"  [SM] [{i+1}] {status}")
         if status == 'completed' and url:
-            print(f"  [SM] Done! {url[:60]}")
+            print(f"  [SM] Done!")
             return url
         if status == 'failed':
             print(f"  [SM] Failed: {proj.get('failureReason')}")
@@ -283,9 +355,9 @@ def submagic_process(video_path, pid, template):
     return None
 
 
-def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, sb):
+def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, sb):
     with tempfile.TemporaryDirectory() as tmp:
-        print(f"[{pid}] START {duration}s {len(video_urls)} videos style={style} vfx={vfx}")
+        print(f"[{pid}] START {duration}s {len(video_urls)} videos style={style} vfx={vfx} free={is_free}")
 
         clips_needed = math.ceil(duration / 3.0) + 2
         clips_per_video = math.ceil(clips_needed / max(len(video_urls), 1)) + 2
@@ -381,14 +453,17 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if res.returncode != 0:
-            raise Exception(f"FFmpeg: {res.stderr[-300:]}")
+            raise Exception(f"FFmpeg mix: {res.stderr[-300:]}")
 
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"  mix OK ({size_mb:.1f}MB)")
         try: os.remove(assembled)
         except: pass
 
-        # 5. VFX
+        # 5. FILIGRANE PERMANENT (gravé dans la vidéo)
+        output = add_watermark(output, tmp, duration, is_free)
+
+        # 6. VFX (optionnel)
         if vfx and FILM_BURN_URL:
             try:
                 film_burn_path = f"{tmp}/film_burn.mp4"
@@ -400,7 +475,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         elif vfx:
             print("  VFX skipped: FILM_BURN_URL not set")
 
-        # 6. SUBMAGIC
+        # 7. SUBMAGIC
         final_url = submagic_process(output, pid, style)
 
         if final_url:
