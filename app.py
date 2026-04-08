@@ -166,7 +166,7 @@ def create_whoosh_sound(tmp, duration_s=0.4):
 
 
 def add_watermark(video_path, tmp, duration, is_free):
-    """Filigrane image Ad Machine — plan gratuit uniquement"""
+    """Filigrane image Ad Machine — plan gratuit uniquement. Pleine largeur, centré."""
     if not is_free:
         print("  Watermark skipped (paid plan)")
         return video_path
@@ -181,13 +181,15 @@ def add_watermark(video_path, tmp, duration, is_free):
         print(f"  Watermark decode error: {e}")
         return video_path
 
-    # 1 seul filigrane image centré au milieu
+    # Filigrane agrandi pleine largeur (1080px), centré verticalement
+    # scale=1080:-1 = pleine largeur en gardant le ratio
     res = subprocess.run([
         'ffmpeg', '-y',
         '-i', video_path,
         '-i', wm_path,
         '-filter_complex',
-        '[1:v]scale=380:95[wm];[0:v][wm]overlay=(W-w)/2:(H-h)/2:format=auto[vout]',
+        '[1:v]scale=1080:-1,format=rgba,colorchannelmixer=aa=0.55[wm];'
+        '[0:v][wm]overlay=0:(H-h)/2:format=auto[vout]',
         '-map', '[vout]', '-map', '0:a?',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
         '-c:a', 'copy',
