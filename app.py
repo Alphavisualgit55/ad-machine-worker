@@ -477,51 +477,35 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if not with_captions:
             print("  Captions skipped by user")
 
+        # Choisir la vidéo source finale
         if submagic_url:
-            if is_free:
-                # Re-télécharger et re-appliquer filigrane sur vidéo Submagic
-                try:
-                    sm_local = f"{tmp}/submagic_out.mp4"
-                    dl(submagic_url, sm_local)
-                    sm_wm = add_watermark(sm_local, tmp, duration, is_free)
-                    filename = f"renders/{pid}/final.mp4"
-                    with open(sm_wm, 'rb') as f: video_bytes = f.read()
-                    sb.upload('videos', filename, video_bytes)
-                    final_url = sb.public_url('videos', filename)
-                    print("  Submagic+watermark uploaded OK")
-                except Exception as e:
-                    print(f"  Re-watermark error: {e}")
-                    filename = f"renders/{pid}/final.mp4"
-                    with open(output, 'rb') as f: video_bytes = f.read()
-                    sb.upload('videos', filename, video_bytes)
-                    final_url = sb.public_url('videos', filename)
-            else:
-                # Plan payant — upload Submagic sur Supabase sans filigrane
-                try:
-                    sm_local = f"{tmp}/submagic_out.mp4"
-                    dl(submagic_url, sm_local)
-                    filename = f"renders/{pid}/final.mp4"
-                    with open(sm_local, 'rb') as f: video_bytes = f.read()
-                    sb.upload('videos', filename, video_bytes)
-                    final_url = sb.public_url('videos', filename)
-                    print("  Submagic uploaded to Supabase OK")
-                except Exception as e:
-                    print(f"  Upload error: {e}")
-                    final_url = submagic_url
+            print(f"  Downloading Submagic output...")
+            try:
+                sm_local = f"{tmp}/submagic_out.mp4"
+                dl(submagic_url, sm_local)
+                video_final = sm_local
+                print("  Submagic downloaded OK")
+            except Exception as e:
+                print(f"  Submagic download error: {e} — using local output")
+                video_final = output
+        else:
+            video_final = output
 
-            sb.update_video(pid, {'video_url': final_url})
-            sb.update_project(pid, {'status': 'done'})
-            return final_url
+        # Appliquer filigrane si plan gratuit
+        print(f"  Applying watermark (is_free={is_free})...")
+        if is_free:
+            video_final = add_watermark(video_final, tmp, duration, is_free)
 
-        # Fallback Supabase
-        print("  Fallback Supabase...")
+        # Upload sur Supabase
         filename = f"renders/{pid}/final.mp4"
-        with open(output, 'rb') as f: video_bytes = f.read()
+        print(f"  Uploading to Supabase...")
+        with open(video_final, 'rb') as f: video_bytes = f.read()
         sb.upload('videos', filename, video_bytes)
         final_url = sb.public_url('videos', filename)
+        print(f"  Upload OK: {final_url[:60]}")
+
         sb.update_video(pid, {'video_url': final_url})
         sb.update_project(pid, {'status': 'done'})
-        print("  Upload OK")
         return final_url
 
 
