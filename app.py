@@ -192,7 +192,8 @@ def add_watermark(video_path, tmp, duration, is_free):
         '[0:v][wm]overlay=0:(H-h)/2:format=auto[vout]',
         '-map', '[vout]', '-map', '0:a?',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
-        '-c:a', 'copy',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '192k',
         '-movflags', '+faststart', '-t', str(duration), output
     ], capture_output=True, text=True, timeout=300)
 
@@ -381,7 +382,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     r = subprocess.run([
                         'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
                         '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-an', out
+                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p', '-an', out
                     ], capture_output=True)
                     if r.returncode == 0: clips.append(out)
                     c_idx += 1; start += 3.0
@@ -408,8 +409,8 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         assembled = f"{tmp}/assembled.mp4"
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
-            '-t', str(duration), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-r', '30',
-            assembled
+            '-t', str(duration), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-pix_fmt', 'yuv420p', '-r', '30', assembled
         ], check=True, capture_output=True)
         print("  assembled OK")
 
@@ -452,6 +453,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
 
         cmd += ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+                '-pix_fmt', 'yuv420p',
                 '-movflags', '+faststart', '-r', '30', '-t', str(duration), output]
 
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -469,9 +471,6 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 output = apply_vfx(output, tmp, duration)
             except Exception as e:
                 print(f"  VFX error (skipping): {e}")
-
-        # 6. FILIGRANE — 1 seul, image Ad Machine, au centre
-        output = add_watermark(output, tmp, duration, is_free)
 
         # 7. SUBMAGIC captions (optionnel)
         submagic_url = submagic_process(output, pid, style) if with_captions else None
