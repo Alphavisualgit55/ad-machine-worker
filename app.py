@@ -71,7 +71,7 @@ def render():
     def run():
         sb = SB(sb_url, sb_key)
         try:
-            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, sb)
+            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, sb)
             print(f"[{pid}] DONE")
         except Exception as e:
             traceback.print_exc()
@@ -144,10 +144,10 @@ def add_watermark(video_path, tmp, duration, is_free):
         '-i', wm_path,
         '-filter_complex', overlay_filter,
         '-map', '[vout]', '-map', '0:a?',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'copy',
         '-movflags', '+faststart', '-t', str(duration), output
-    ], capture_output=True, text=True, timeout=120)
+    ], capture_output=True, text=True, timeout=600)
 
     if res.returncode != 0:
         print(f"  Watermark error: {res.stderr[-400:]}")
@@ -161,9 +161,9 @@ def add_watermark(video_path, tmp, duration, is_free):
         res2 = subprocess.run([
             'ffmpeg', '-y', '-i', video_path,
             '-vf', wm_filter,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
             '-c:a', 'copy', '-t', str(duration), output
-        ], capture_output=True, text=True, timeout=120)
+        ], capture_output=True, text=True, timeout=300)
         if res2.returncode != 0:
             return video_path
 
@@ -279,7 +279,7 @@ def apply_vfx(video_path, tmp, duration, film_burn_path):
             cmd += [
                 '-filter_complex', full_fc,
                 '-map', '[vout]', '-map', '[aout]',
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
                 '-c:a', 'aac', '-b:a', '192k',
                 '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
             ]
@@ -287,12 +287,12 @@ def apply_vfx(video_path, tmp, duration, film_burn_path):
             cmd += [
                 '-filter_complex', filter_complex,
                 '-map', '[vout]', '-map', '0:a',
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
                 '-c:a', 'copy',
                 '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
             ]
 
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if res.returncode != 0:
             print(f"  VFX error: {res.stderr[-300:]}")
             return video_path
@@ -377,7 +377,7 @@ def submagic_process(video_path, pid, template):
     return None
 
 
-def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, sb):
+def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, sb):
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{pid}] START {duration}s {len(video_urls)} videos style={style} vfx={vfx} free={is_free}")
 
@@ -400,7 +400,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     r = subprocess.run([
                         'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
                         '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-an', out
+                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-an', out
                     ], capture_output=True)
                     if r.returncode == 0: clips.append(out)
                     c_idx += 1; start += 3.0
@@ -427,7 +427,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         assembled = f"{tmp}/assembled.mp4"
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
-            '-t', str(duration), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20', '-r', '30',
+            '-t', str(duration), '-c:v', 'copy', '-r', '30',
             assembled
         ], check=True, capture_output=True)
         print("  assembled OK")
@@ -470,10 +470,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     f'[v][m]amix=inputs=2:duration=first:normalize=0[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
 
-        cmd += ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        cmd += ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
                 '-movflags', '+faststart', '-r', '30', '-t', str(duration), output]
 
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if res.returncode != 0:
             raise Exception(f"FFmpeg mix: {res.stderr[-300:]}")
 
@@ -498,8 +498,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         # Comme ça le filigrane est présent même sur la vidéo Submagic téléchargée
         output = add_watermark(output, tmp, duration, is_free)
 
-        # 7. SUBMAGIC
-        submagic_url = submagic_process(output, pid, style)
+        # 7. SUBMAGIC (seulement si captions activées)
+        submagic_url = submagic_process(output, pid, style) if with_captions else None
+        if not with_captions:
+            print('  Captions skipped by user')
 
         if submagic_url:
             if is_free:
