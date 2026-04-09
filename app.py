@@ -188,7 +188,7 @@ def add_watermark(video_path, tmp, duration, is_free):
         '-i', video_path,
         '-i', wm_path,
         '-filter_complex',
-        '[1:v]scale=1080:-1,format=rgba,colorchannelmixer=aa=0.55[wm];'
+        '[1:v]scale=1080:-1,format=rgba,colorchannelmixer=aa=0.70[wm];'
         '[0:v][wm]overlay=0:(H-h)/2:format=auto[vout]',
         '-map', '[vout]', '-map', '0:a?',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
@@ -420,6 +420,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 except: pass
 
         # 3. VOIX + MUSIQUE
+        # Nettoyer voiceover des titres parasites
+        import re as _re
+        voiceover = _re.sub(r'^[#\s\*]*[^\n]{0,60}\n', '', voiceover).strip()
+        voiceover = _re.sub(r'[#\*`]', '', voiceover).strip()
         voice_path = music_path = None
         if voice_url:
             try:
@@ -497,7 +501,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
             video_final = add_watermark(video_final, tmp, duration, is_free)
 
         # Upload sur Supabase
-        filename = f"renders/{pid}/final.mp4"
+        filename = f"renders/{pid}/ad_machine_{pid[:8]}.mp4"
         print(f"  Uploading to Supabase...")
         with open(video_final, 'rb') as f: video_bytes = f.read()
         sb.upload('videos', filename, video_bytes)
