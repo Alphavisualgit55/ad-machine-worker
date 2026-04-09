@@ -63,6 +63,8 @@ def render():
     vfx          = data.get('vfx', False)
     with_captions = data.get('withCaptions', True)
     is_free      = data.get('isFree', True)
+    user_id      = data.get('userId', '')
+    app_url      = data.get('appUrl', 'https://admachine.netlify.app')
     sb_url       = data.get('supabaseUrl')
     sb_key       = data.get('supabaseKey')
 
@@ -72,7 +74,7 @@ def render():
     def run():
         sb = SB(sb_url, sb_key)
         try:
-            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, sb)
+            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb)
             print(f"[{pid}] DONE")
         except Exception as e:
             traceback.print_exc()
@@ -359,7 +361,7 @@ def submagic_process(video_path, pid, template):
     return None
 
 
-def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, sb):
+def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb):
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{pid}] START {duration}s {len(video_urls)} videos vfx={vfx} captions={with_captions} free={is_free}")
 
@@ -510,6 +512,20 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         sb.update_video(pid, {'video_url': final_url})
         sb.update_project(pid, {'status': 'done'})
+
+        # Notifier l'utilisateur par email si plan Business/Business+
+        if user_id:
+            try:
+                requests.post(f"{app_url}/api/send-notification", json={
+                    'type': 'video_ready',
+                    'userId': user_id,
+                    'videoUrl': final_url,
+                    'projectId': pid,
+                }, timeout=10)
+                print(f"  Notification sent for user {user_id[:8]}")
+            except Exception as e:
+                print(f"  Notification error (non-blocking): {e}")
+
         return final_url
 
 
