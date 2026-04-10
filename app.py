@@ -295,7 +295,7 @@ def apply_vfx(video_path, tmp, duration):
     return output
 
 
-def submagic_process(video_path, pid, template):
+def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     headers_sm = {'x-api-key': SUBMAGIC_KEY}
     valid = ['Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
              'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
@@ -303,16 +303,29 @@ def submagic_process(video_path, pid, template):
     if template not in valid:
         template = 'Hormozi 2'
 
-    print(f"  [SM] Upload template={template}")
+    # Quand VFX Pro activé : activer magicZooms + transitions Submagic
+    magic_zooms = 'true' if use_vfx_transitions else 'false'
+    silence_pace = 'natural' if use_vfx_transitions else 'natural'
+
+    print(f"  [SM] Upload template={template} magicZooms={magic_zooms} vfx={use_vfx_transitions}")
     try:
         with open(video_path, 'rb') as f:
+            form_data = {
+                'title': f'AdMachine-{pid[:8]}',
+                'language': 'fr',
+                'templateName': template,
+                'magicZooms': magic_zooms,
+                'removeSilencePace': silence_pace,
+            }
+            if use_vfx_transitions:
+                # Activer les transitions avancées Submagic
+                form_data['transitions'] = 'true'
+                form_data['animations'] = 'true'
             resp = requests.post(
                 f'{SUBMAGIC_URL}/projects/upload',
                 headers=headers_sm,
                 files={'file': ('video.mp4', f, 'video/mp4')},
-                data={'title': f'AdMachine-{pid[:8]}', 'language': 'fr',
-                      'templateName': template, 'magicZooms': 'true',
-                      'removeSilencePace': 'natural'},
+                data=form_data,
                 timeout=180
             )
     except Exception as e:
@@ -479,15 +492,18 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         try: os.remove(assembled)
         except: pass
 
-        # 5. VFX — film burn généré par Ad Machine + son whoosh
+        # 5. VFX Pro — si activé, forcer Submagic (captions obligatoires)
+        # Les effets visuels sont gérés nativement par Submagic (magicZooms + transitions)
         if vfx:
-            try:
-                output = apply_vfx(output, tmp, duration)
-            except Exception as e:
-                print(f"  VFX error (skipping): {e}")
+            with_captions = True  # VFX nécessite Submagic
+            print("  VFX Pro: Submagic forcé (magicZooms + transitions)")
 
-        # 7. SUBMAGIC captions (optionnel)
-        submagic_url = submagic_process(output, pid, style) if with_captions else None
+        # 5b. VFX Pro → utiliser transitions Submagic au lieu de film burn maison
+        # Le film burn FFmpeg est désormais remplacé par les effets Submagic natifs
+        # (magicZooms + transitions activés dans submagic_process quand vfx=True)
+
+        # 7. SUBMAGIC captions (optionnel) — passer vfx pour activer transitions
+        submagic_url = submagic_process(output, pid, style, use_vfx_transitions=vfx) if with_captions else None
         if not with_captions:
             print("  Captions skipped by user")
 
