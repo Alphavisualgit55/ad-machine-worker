@@ -445,12 +445,20 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if voice_path: cmd += ['-i', voice_path]; n += 1
         if music_path: cmd += ['-i', music_path]; n += 1
 
+        # Durée réelle = durée de la voix off (priorité) ou duration fixe
+        actual_duration = duration
+        if voice_path:
+            try:
+                actual_duration = get_duration(voice_path)
+                print(f"  voice duration={actual_duration:.1f}s (target={duration}s)")
+            except: pass
+
         if n == 1:
             cmd += ['-an']
         elif n == 2 and voice_path:
-            cmd += ['-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '192k', '-t', str(duration)]
+            cmd += ['-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '192k']
         elif n == 2 and music_path:
-            cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{duration}[a]',
+            cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{actual_duration}[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
         else:
             cmd += ['-filter_complex',
@@ -460,7 +468,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         cmd += ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
                 '-pix_fmt', 'yuv420p',
-                '-movflags', '+faststart', '-r', '30', '-t', str(duration), output]
+                '-movflags', '+faststart', '-r', '30', '-t', str(actual_duration), output]
 
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if res.returncode != 0:
