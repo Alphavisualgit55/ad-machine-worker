@@ -296,99 +296,138 @@ def apply_vfx(video_path, tmp, duration):
 
 
 def submagic_process(video_path, pid, template, use_vfx_transitions=False):
-    headers_sm = {
-        'x-api-key': SUBMAGIC_KEY,
-        'Authorization': f'Bearer {SUBMAGIC_KEY}',
-    }
-    valid = ['Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
-             'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
-             'Daniel','Dan','Devin','Tayo','Jason','Noah']
-    if template not in valid:
+    """
+    Submagic API v1 — Upload vidéo + captions synchronisées
+    Doc: https://docs.submagic.co
+    """
+    # Headers: x-api-key seulement (pas Bearer)
+    headers_sm = {'x-api-key': SUBMAGIC_KEY}
+
+    valid_templates = [
+        'Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
+        'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
+        'Daniel','Dan','Devin','Tayo','Jason','Noah'
+    ]
+    if template not in valid_templates:
         template = 'Hormozi 2'
 
-    # Quand VFX Pro activé : activer magicZooms + transitions Submagic
-    magic_zooms = 'true' if use_vfx_transitions else 'false'
-    silence_pace = 'natural' if use_vfx_transitions else 'natural'
+    print(f"  [SM] Starting — template={template} vfx={use_vfx_transitions} key={SUBMAGIC_KEY[:12]}...")
 
-    print(f"  [SM] Upload template={template} magicZooms={magic_zooms} vfx={use_vfx_transitions}")
+    # STEP 1: Upload la vidéo
     try:
         with open(video_path, 'rb') as f:
-            form_data = {
+            video_bytes = f.read()
+
+        file_size = len(video_bytes)
+        print(f"  [SM] Uploading {file_size/1024/1024:.1f}MB...")
+
+        resp = requests.post(
+            f'{SUBMAGIC_URL}/projects/upload',
+            headers=headers_sm,
+            files={'file': ('video.mp4', video_bytes, 'video/mp4')},
+            data={
                 'title': f'AdMachine-{pid[:8]}',
                 'language': 'fr',
                 'templateName': template,
-                'magicZooms': magic_zooms,
-                'removeSilencePace': silence_pace,
-            }
-            if use_vfx_transitions:
-                # Activer les transitions avancées Submagic
-                form_data['transitions'] = 'true'
-                form_data['animations'] = 'true'
-            resp = requests.post(
-                f'{SUBMAGIC_URL}/projects/upload',
-                headers=headers_sm,
-                files={'file': ('video.mp4', f, 'video/mp4')},
-                data=form_data,
-                timeout=180
-            )
+                'magicZooms': 'true' if use_vfx_transitions else 'false',
+            },
+            timeout=300
+        )
     except Exception as e:
-        print(f"  [SM] Error: {e}")
+        print(f"  [SM] Upload exception: {e}")
         return None
 
-    print(f"  [SM] Upload: {resp.status_code} — {resp.text[:200]}")
-    if resp.status_code in [401, 403]:
-        print(f"  [SM] AUTH FAILED — clé API invalide ou expirée")
-        return None
+    print(f"  [SM] Upload response: {resp.status_code}")
+    print(f"  [SM] Upload body: {resp.text[:500]}")
+
     if not resp.ok:
-        print(f"  [SM] Upload FAILED: {resp.status_code} {resp.text[:300]}")
+        print(f"  [SM] Upload FAILED ({resp.status_code})")
         return None
 
     try:
         sm_data = resp.json()
-    except:
-        print(f"  [SM] JSON parse error: {resp.text[:200]}")
+    except Exception as e:
+        print(f"  [SM] JSON error: {e} — raw: {resp.text[:300]}")
         return None
-    sm_id = sm_data.get('id') or sm_data.get('projectId') or sm_data.get('project_id')
-    print(f"  [SM] ID: {sm_id} — keys: {list(sm_data.keys())}")
+
+    # Chercher l'ID dans tous les champs possibles
+    sm_id = (sm_data.get('id') or sm_data.get('projectId') or
+             sm_data.get('project_id') or sm_data.get('_id'))
+    print(f"  [SM] Project ID: {sm_id} — response keys: {list(sm_data.keys())}")
+
     if not sm_id:
-        print(f"  [SM] No ID in response: {sm_data}")
+        print(f"  [SM] No project ID found in: {sm_data}")
         return None
 
-    for i in range(30):  # max 2.5 min pour transcription
+    # STEP 2: Attendre transcription
+    print(f"  [SM] Waiting for transcription...")
+    for i in range(40):
         time.sleep(5)
-        r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
-        if not r.ok: continue
-        proj = r.json()
-        status = proj.get('status')
-        trans = proj.get('transcriptionStatus')
-        print(f"  [SM] [{i+1}] {status}/{trans}")
-        if status == 'failed': return None
-        if trans == 'COMPLETED': break
+        try:
+            r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}',
+                           headers=headers_sm, timeout=15)
+            if not r.ok:
+                print(f"  [SM] Poll error: {r.status_code}")
+                continue
+            proj = r.json()
+            status = proj.get('status', '')
+            trans = proj.get('transcriptionStatus', '')
+            if i % 4 == 0:
+                print(f"  [SM] [{i+1}] status={status} transcription={trans}")
+            if status == 'failed':
+                print(f"  [SM] Failed: {proj.get('failureReason', 'unknown')}")
+                return None
+            if trans == 'COMPLETED' or status == 'completed':
+                print(f"  [SM] Transcription done!")
+                break
+        except Exception as e:
+            print(f"  [SM] Poll exception: {e}")
+            continue
 
-    exp = requests.post(f'{SUBMAGIC_URL}/projects/{sm_id}/export',
-        headers={**headers_sm, 'Content-Type': 'application/json'},
-        json={'width': 1080, 'height': 1920, 'fps': 30}, timeout=30)
-    print(f"  [SM] Export: {exp.status_code} — {exp.text[:200]}")
-    if not exp.ok:
-        print(f"  [SM] Export FAILED: {exp.text[:300]}")
-        return None
-
-    for i in range(60):  # max 5 min pour export
-        time.sleep(5)
-        r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
-        if not r.ok: continue
-        proj = r.json()
-        status = proj.get('status')
-        url = proj.get('directUrl') or proj.get('downloadUrl')
-        if i % 6 == 0: print(f"  [SM] [{i+1}] {status}")
-        if status == 'completed' and url:
-            print(f"  [SM] Done!")
-            return url
-        if status == 'failed':
-            print(f"  [SM] Failed: {proj.get('failureReason')}")
+    # STEP 3: Exporter
+    print(f"  [SM] Requesting export...")
+    try:
+        exp = requests.post(
+            f'{SUBMAGIC_URL}/projects/{sm_id}/export',
+            headers={**headers_sm, 'Content-Type': 'application/json'},
+            json={'width': 1080, 'height': 1920, 'fps': 30},
+            timeout=30
+        )
+        print(f"  [SM] Export response: {exp.status_code} — {exp.text[:300]}")
+        if not exp.ok:
+            print(f"  [SM] Export failed")
             return None
+    except Exception as e:
+        print(f"  [SM] Export exception: {e}")
+        return None
 
-    print("  [SM] Timeout — fallback sur vidéo locale")
+    # STEP 4: Attendre le rendu final
+    print(f"  [SM] Waiting for render...")
+    for i in range(60):
+        time.sleep(5)
+        try:
+            r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}',
+                           headers=headers_sm, timeout=15)
+            if not r.ok: continue
+            proj = r.json()
+            status = proj.get('status', '')
+            url = (proj.get('directUrl') or proj.get('downloadUrl') or
+                   proj.get('outputUrl') or proj.get('videoUrl') or
+                   proj.get('url'))
+            if i % 6 == 0:
+                print(f"  [SM] [{i+1}] status={status} url={'yes' if url else 'no'}")
+                print(f"  [SM] keys: {list(proj.keys())}")
+            if status == 'completed' and url:
+                print(f"  [SM] Done! url={url[:60]}")
+                return url
+            if status == 'failed':
+                print(f"  [SM] Render failed: {proj.get('failureReason')}")
+                return None
+        except Exception as e:
+            print(f"  [SM] Render poll exception: {e}")
+            continue
+
+    print("  [SM] Timeout after 5min — using local video")
     return None
 
 
