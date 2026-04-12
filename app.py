@@ -5,7 +5,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-SUBMAGIC_KEY = 'sk-65c7ec039cc99e9f86333a018e208550f8b4f9725dfe80e8a8d2103ad53aed0f'
+SUBMAGIC_KEY = 'sk-b0e3311c51f0d1251a5e43cdb7086fb05fe4cec827a848ad47bd2905a3bb7643'
 SUBMAGIC_URL = 'https://api.submagic.co/v1'
 FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
 
@@ -332,13 +332,26 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
         print(f"  [SM] Error: {e}")
         return None
 
-    print(f"  [SM] Upload: {resp.status_code}")
-    if not resp.ok: return None
+    print(f"  [SM] Upload: {resp.status_code} — {resp.text[:200]}")
+    if resp.status_code in [401, 403]:
+        print(f"  [SM] AUTH FAILED — clé API invalide ou expirée")
+        return None
+    if not resp.ok:
+        print(f"  [SM] Upload FAILED: {resp.status_code} {resp.text[:300]}")
+        return None
 
-    sm_id = resp.json().get('id')
-    print(f"  [SM] ID: {sm_id}")
+    try:
+        sm_data = resp.json()
+    except:
+        print(f"  [SM] JSON parse error: {resp.text[:200]}")
+        return None
+    sm_id = sm_data.get('id') or sm_data.get('projectId') or sm_data.get('project_id')
+    print(f"  [SM] ID: {sm_id} — keys: {list(sm_data.keys())}")
+    if not sm_id:
+        print(f"  [SM] No ID in response: {sm_data}")
+        return None
 
-    for i in range(60):
+    for i in range(30):  # max 2.5 min pour transcription
         time.sleep(5)
         r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
         if not r.ok: continue
@@ -352,10 +365,12 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     exp = requests.post(f'{SUBMAGIC_URL}/projects/{sm_id}/export',
         headers={**headers_sm, 'Content-Type': 'application/json'},
         json={'width': 1080, 'height': 1920, 'fps': 30}, timeout=30)
-    print(f"  [SM] Export: {exp.status_code}")
-    if not exp.ok: return None
+    print(f"  [SM] Export: {exp.status_code} — {exp.text[:200]}")
+    if not exp.ok:
+        print(f"  [SM] Export FAILED: {exp.text[:300]}")
+        return None
 
-    for i in range(120):
+    for i in range(60):  # max 5 min pour export
         time.sleep(5)
         r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
         if not r.ok: continue
@@ -370,7 +385,7 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
             print(f"  [SM] Failed: {proj.get('failureReason')}")
             return None
 
-    print("  [SM] Timeout")
+    print("  [SM] Timeout — fallback sur vidéo locale")
     return None
 
 
@@ -507,19 +522,20 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if not with_captions:
             print("  Captions skipped by user")
 
-        # Choisir la vidéo source finale
+        # Choisir la vidéo finale — fallback sur vidéo locale si Submagic échoue
+        video_final = output  # défaut = vidéo locale
         if submagic_url:
             print(f"  Downloading Submagic output...")
             try:
                 sm_local = f"{tmp}/submagic_out.mp4"
                 dl(submagic_url, sm_local)
-                video_final = sm_local
-                print("  Submagic downloaded OK")
+                if os.path.exists(sm_local) and os.path.getsize(sm_local) > 10000:
+                    video_final = sm_local
+                    print("  Submagic downloaded OK")
+                else:
+                    print("  Submagic file trop petit — fallback vidéo locale")
             except Exception as e:
-                print(f"  Submagic download error: {e} — using local output")
-                video_final = output
-        else:
-            video_final = output
+                print(f"  Submagic download error: {e} — fallback vidéo locale")
 
         # Appliquer filigrane si plan gratuit
         print(f"  Applying watermark (is_free={is_free})...")
