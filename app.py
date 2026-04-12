@@ -351,12 +351,22 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     """
     headers_sm = {'x-api-key': SUBMAGIC_KEY}
 
+    # Templates disponibles dans Submagic API
     valid_templates = [
         'Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
         'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
-        'Daniel','Dan','Devin','Tayo','Jason','Noah'
+        'Daniel','Dan','Dan 2','Devin','Tayo','Jason','Noah',
+        'Kelly','Kelly 2','William','Mia','Tom','Zoe'
     ]
+    # Mapping des noms custom vers noms Submagic
+    template_map = {
+        'Kelly 2': 'Kelly 2',
+        'Dan 2': 'Dan 2',
+        'William': 'William',
+    }
+    template = template_map.get(template, template)
     if template not in valid_templates:
+        print(f"  [SM] Template '{template}' inconnu → Hormozi 2")
         template = 'Hormozi 2'
 
     print(f"  [SM] Starting — template={template} vfx={use_vfx_transitions} key={SUBMAGIC_KEY[:12]}...")
