@@ -296,7 +296,10 @@ def apply_vfx(video_path, tmp, duration):
 
 
 def submagic_process(video_path, pid, template, use_vfx_transitions=False):
-    headers_sm = {'x-api-key': SUBMAGIC_KEY}
+    headers_sm = {
+        'x-api-key': SUBMAGIC_KEY,
+        'Authorization': f'Bearer {SUBMAGIC_KEY}',
+    }
     valid = ['Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
              'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
              'Daniel','Dan','Devin','Tayo','Jason','Noah']
