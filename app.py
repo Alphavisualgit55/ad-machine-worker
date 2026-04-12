@@ -218,16 +218,10 @@ def add_watermark(video_path, tmp, duration, is_free):
 
 def apply_vfx(video_path, tmp, duration):
     """
-    VFX Pro: overlay filmburn fond noir, rendu propre sans filtre rose.
-    
-    Méthode: convertir les deux streams en gbrp (planar RGB) avant blend.
-    En RGB planaire, blend=screen fonctionne correctement sans artefact de couleur.
-    Fond noir (0,0,0) en screen = transparent → l'overlay film burn s'affiche proprement.
-    
-    screen formula: out = 1-(1-src)*(1-ovr)
-    Si ovr=0 (noir) → out = src (vidéo originale, pas de changement)
-    Si ovr=1 (blanc) → out = 1 (blanc)
-    Si ovr=flamme orange → couleurs chaudes s'ajoutent sur la vidéo
+    VFX Pro: overlay filmburn fond noir, N fois (3-5) à positions aléatoires.
+    - format=gbrp pour blend screen sans filtre rose
+    - split filter pour dupliquer l'overlay en N copies indépendantes
+    - enable='between(t,start,end)' pour cibler les fenêtres exactes
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
@@ -254,38 +248,34 @@ def apply_vfx(video_path, tmp, duration):
             pos = max(0.0, min(actual_dur - overlay_dur, round(base + jitter, 2)))
             positions.append(pos)
         positions.sort()
-        print(f"  [VFX] {nb}x overlay at {[round(p,1) for p in positions]}")
+        print(f"  [VFX] {nb}x overlay pos={[round(p,1) for p in positions]}")
 
-        # Préparer l'overlay: scale 1080x1920 + conversion gbrp (RGB planaire)
-        # gbrp = format RGB planaire qui supporte blend=screen sans artefacts couleur
-        prep_parts = [
+        # Filtres vidéo
+        filter_parts = [
+            # Scale + format gbrp (RGB planaire = screen sans artefact rose)
             "[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920,format=gbrp[ovbase]"
+            "crop=1080:1920,format=gbrp[ovbase]",
+            # Split en N copies independantes
+            f"[ovbase]split={nb}" + "".join(f"[ovcopy{i}]" for i in range(nb)),
+            # Vidéo principale en gbrp
+            "[0:v]format=gbrp[mainv]"
         ]
-
-        # Vidéo principale aussi en gbrp
-        prep_parts.append("[0:v]format=gbrp[mainv]")
 
         current = "[mainv]"
         for i, pos in enumerate(positions):
             end_pos = round(pos + overlay_dur, 2)
-            # Décaler l'overlay dans le temps
-            prep_parts.append(
-                f"[ovbase]setpts=PTS-STARTPTS+{pos}/TB[ov{i}]"
-            )
-            # blend=screen en gbrp: fond noir → transparent, flammes → visibles
+            filter_parts.append(f"[ovcopy{i}]setpts=PTS-STARTPTS+{pos}/TB[ov{i}]")
             out = f"[v{i+1}]"
-            prep_parts.append(
-                f"{current}[ov{i}]blend=all_mode=screen:all_opacity=1:"
+            filter_parts.append(
+                f"{current}[ov{i}]blend=all_mode=lighten:all_opacity=0.8:"
                 f"enable='between(t,{pos},{end_pos})':shortest=0:repeatlast=0{out}"
             )
             current = out
 
-        # Reconvertir en yuv420p pour l'encodage final
-        last_label = f"[v{nb}]"
-        prep_parts.append(f"{last_label}format=yuv420p[vout]")
+        # Reconvertir en yuv420p pour l'encodage
+        filter_parts.append(f"[v{nb}]format=yuv420p[vout]")
 
-        # Audio: overlay à 70% aux positions exactes
+        # Filtres audio: overlay à 70% aux positions
         audio_parts = []
         for i, pos in enumerate(positions):
             audio_parts.append(
@@ -297,7 +287,7 @@ def apply_vfx(video_path, tmp, duration):
             f"[0:a]{a_labels}amix=inputs={nb+1}:duration=first:normalize=0[aout]"
         )
 
-        filter_complex = ";".join(prep_parts + audio_parts)
+        filter_complex = ";".join(filter_parts + audio_parts)
 
         res = subprocess.run([
             'ffmpeg', '-y',
@@ -314,10 +304,10 @@ def apply_vfx(video_path, tmp, duration):
 
         if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 10000:
             size = os.path.getsize(output) / 1024 / 1024
-            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x filmburn gbrp screen")
+            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x filmburn screen blend")
             return output
         else:
-            print(f"  [VFX] Error: {res.stderr[-800:]}")
+            print(f"  [VFX] Error: {res.stderr[-600:]}")
             return video_path
 
     except Exception as e:
