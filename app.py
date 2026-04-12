@@ -218,9 +218,16 @@ def add_watermark(video_path, tmp, duration, is_free):
 
 def apply_vfx(video_path, tmp, duration):
     """
-    VFX Pro: overlay filmburn fond noir appliqué N fois.
-    Fond noir = transparent grâce à colorkey ou format RGB + multiply inverse.
-    Utilise overlay filter (pas blend) pour éviter le filtre rose.
+    VFX Pro: overlay filmburn fond noir, rendu propre sans filtre rose.
+    
+    Méthode: convertir les deux streams en gbrp (planar RGB) avant blend.
+    En RGB planaire, blend=screen fonctionne correctement sans artefact de couleur.
+    Fond noir (0,0,0) en screen = transparent → l'overlay film burn s'affiche proprement.
+    
+    screen formula: out = 1-(1-src)*(1-ovr)
+    Si ovr=0 (noir) → out = src (vidéo originale, pas de changement)
+    Si ovr=1 (blanc) → out = 1 (blanc)
+    Si ovr=flamme orange → couleurs chaudes s'ajoutent sur la vidéo
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
@@ -238,7 +245,7 @@ def apply_vfx(video_path, tmp, duration):
         overlay_dur = get_duration(overlay_path)
         nb = random.randint(3, 5)
 
-        # Positions uniformément espacées + jitter
+        # Positions espacées avec jitter
         spacing = actual_dur / (nb + 1)
         positions = []
         for i in range(nb):
@@ -247,59 +254,38 @@ def apply_vfx(video_path, tmp, duration):
             pos = max(0.0, min(actual_dur - overlay_dur, round(base + jitter, 2)))
             positions.append(pos)
         positions.sort()
-        print(f"  [VFX] {nb}x overlay at {positions}")
+        print(f"  [VFX] {nb}x overlay at {[round(p,1) for p in positions]}")
 
-        # Étape 1: préparer l'overlay avec fond noir → alpha transparent
-        # On convertit l'overlay en RGBA et on utilise colorkey pour rendre
-        # le noir transparent, puis on overlay sur la vidéo principale
-        overlay_rgba = f"{tmp}/overlay_rgba.mp4"
+        # Préparer l'overlay: scale 1080x1920 + conversion gbrp (RGB planaire)
+        # gbrp = format RGB planaire qui supporte blend=screen sans artefacts couleur
+        prep_parts = [
+            "[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,format=gbrp[ovbase]"
+        ]
 
-        # Convertir overlay: noir → transparent via colorkey
-        # colorkey=0x000000:0.2:0.1 rend les pixels proches du noir transparents
-        res_prep = subprocess.run([
-            'ffmpeg', '-y', '-i', overlay_path,
-            '-vf', 'colorkey=0x000000:0.25:0.05,format=yuva420p',
-            '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p',
-            '-an', overlay_rgba
-        ], capture_output=True, text=True, timeout=120)
+        # Vidéo principale aussi en gbrp
+        prep_parts.append("[0:v]format=gbrp[mainv]")
 
-        if res_prep.returncode != 0:
-            # Fallback: webm ne marche pas → utiliser une autre approche
-            # Approche 2: chromakey via geq pour simuler screen sans blend
-            print(f"  [VFX] colorkey prep failed, using direct screen filter")
-            overlay_rgba = overlay_path
-
-        # Étape 2: appliquer l'overlay N fois avec enable conditionnel
-        # Chaque occurrence: [overlay]setpts → overlay sur vidéo avec enable
-        filter_parts = []
-
-        # Préparer l'overlay normalisé (scale uniquement)
-        filter_parts.append(
-            f"[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-            f"crop=1080:1920,format=yuva420p,"
-            f"colorkey=0x000000:0.25:0.05[ov_base]"
-        )
-
-        current = "[0:v]"
+        current = "[mainv]"
         for i, pos in enumerate(positions):
             end_pos = round(pos + overlay_dur, 2)
-            out = f"[v{i+1}]"
-            # Décaler le PTS de l'overlay pour qu'il commence à 'pos'
-            filter_parts.append(
-                f"[ov_base]setpts=PTS-STARTPTS+{pos}/TB[ov{i}]"
+            # Décaler l'overlay dans le temps
+            prep_parts.append(
+                f"[ovbase]setpts=PTS-STARTPTS+{pos}/TB[ov{i}]"
             )
-            # Overlay avec enable: s'affiche seulement entre pos et end_pos
-            filter_parts.append(
-                f"{current}[ov{i}]overlay=0:0:"
-                f"enable='between(t,{pos},{end_pos})':format=auto[v{i+1}]"
+            # blend=screen en gbrp: fond noir → transparent, flammes → visibles
+            out = f"[v{i+1}]"
+            prep_parts.append(
+                f"{current}[ov{i}]blend=all_mode=screen:all_opacity=1:"
+                f"enable='between(t,{pos},{end_pos})':shortest=0:repeatlast=0{out}"
             )
             current = out
 
-        # Renommer le dernier label en [vout]
-        # Remplacer le dernier out_label
-        filter_parts[-1] = filter_parts[-1].replace(f"[v{nb}]", "[vout]")
+        # Reconvertir en yuv420p pour l'encodage final
+        last_label = f"[v{nb}]"
+        prep_parts.append(f"{last_label}format=yuv420p[vout]")
 
-        # Audio: overlay à 70% aux positions
+        # Audio: overlay à 70% aux positions exactes
         audio_parts = []
         for i, pos in enumerate(positions):
             audio_parts.append(
@@ -311,7 +297,7 @@ def apply_vfx(video_path, tmp, duration):
             f"[0:a]{a_labels}amix=inputs={nb+1}:duration=first:normalize=0[aout]"
         )
 
-        filter_complex = ";".join(filter_parts + audio_parts)
+        filter_complex = ";".join(prep_parts + audio_parts)
 
         res = subprocess.run([
             'ffmpeg', '-y',
@@ -328,10 +314,10 @@ def apply_vfx(video_path, tmp, duration):
 
         if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 10000:
             size = os.path.getsize(output) / 1024 / 1024
-            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x filmburn")
+            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x filmburn gbrp screen")
             return output
         else:
-            print(f"  [VFX] Error: {res.stderr[-600:]}")
+            print(f"  [VFX] Error: {res.stderr[-800:]}")
             return video_path
 
     except Exception as e:
@@ -486,44 +472,37 @@ BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
 def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
     """Envoie l'email de notification directement depuis le worker via Brevo."""
-    headers = {
+    if not BREVO_API_KEY:
+        print("  [NOTIF] BREVO_API_KEY non configuré — skip email")
+        return
+
+    headers_sb = {
         'apikey': sb_key,
         'Authorization': f'Bearer {sb_key}',
         'Content-Type': 'application/json'
     }
 
-    # 1. Récupérer l'email via l'endpoint admin Supabase (service role requis)
-    # Essayer plusieurs endpoints selon la version Supabase
+    # 1. Récupérer l'email depuis Supabase auth admin
     email = None
-    for endpoint in [
-        f"{sb_url}/auth/v1/admin/users/{user_id}",
-        f"{sb_url}/rest/v1/rpc/get_user_email",
-    ]:
-        try:
-            r = requests.get(endpoint, headers=headers, timeout=10)
-            if r.ok:
-                data = r.json()
-                email = data.get('email') or data.get('user', {}).get('email')
-                if email:
-                    break
-        except: continue
-
-    if not email:
-        # Fallback: chercher dans profiles si email est stocké là
-        rp = requests.get(
-            f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=email",
-            headers=headers, timeout=10
+    try:
+        r = requests.get(
+            f"{sb_url}/auth/v1/admin/users/{user_id}",
+            headers=headers_sb, timeout=10
         )
-        if rp.ok:
-            profiles = rp.json()
-            if profiles:
-                email = profiles[0].get('email')
+        print(f"  [NOTIF] auth lookup: {r.status_code}")
+        if r.ok:
+            data = r.json()
+            email = data.get('email')
+            if not email and 'users' in data:
+                email = data['users'][0].get('email') if data['users'] else None
+    except Exception as e:
+        print(f"  [NOTIF] auth error: {e}")
 
     if not email:
-        print(f"  [NOTIF] No email found for user {user_id[:8]}")
+        print(f"  [NOTIF] No email for {user_id[:8]}")
         return
 
-    print(f"  [NOTIF] Sending to {email[:20]}...")
+    print(f"  [NOTIF] Sending to {email}...")
     
     # 2. Récupérer le prénom depuis profiles
     rp = requests.get(
