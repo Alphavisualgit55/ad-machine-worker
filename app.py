@@ -209,98 +209,64 @@ def add_watermark(video_path, tmp, duration, is_free):
 
 def apply_vfx(video_path, tmp, duration):
     """
-    Film burn généré par Ad Machine (pas de fichier externe).
-    Effet sonore whoosh synchronisé.
-    2-3 burns à des moments aléatoires.
+    VFX Pro FFmpeg natif:
+    1. Ken Burns zoom dynamique sur chaque clip (zoom-in progressif)
+    2. Flash blanc entre les transitions de clips
+    3. Film grain cinéma
+    4. Vignette légère
     """
-    output = f"{tmp}/vfx.mp4"
-
-    # Créer le film burn
-    burn_path = create_film_burn(tmp, duration)
-    if not burn_path:
-        print("  VFX: could not create burn effect")
-        return video_path
-
-    burn_dur = min(get_dur(burn_path), 1.5)
-
-    # Positions aléatoires bien espacées
-    margin = max(2.0, duration * 0.15)
-    n_burns = random.randint(2, 3)
-    positions = []
-    attempts = 0
-    while len(positions) < n_burns and attempts < 100:
-        t = round(random.uniform(margin, duration - margin - burn_dur), 1)
-        if all(abs(t - p) > 4.0 for p in positions):
-            positions.append(t)
-        attempts += 1
-    positions.sort()
-    print(f"  VFX burns at: {positions}s")
-
-    # Créer le son whoosh
-    whoosh_path = create_whoosh_sound(tmp)
-
-    # Construire filter_complex
-    # blend=screen : fond noir devient transparent, feu reste visible
-    fc_parts = []
-    for i, t in enumerate(positions):
-        t2 = round(t + burn_dur, 2)
-        in_v = f'[tmp{i-1}]' if i > 0 else '[0:v]'
-        out_v = f'[tmp{i}]' if i < len(positions) - 1 else '[vout]'
-        fc_parts.append(
-            f'[{i+1}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setpts=PTS-STARTPTS[b{i}];'
-            f'{in_v}[b{i}]blend=all_mode=screen:all_opacity=1.0:enable=\'between(t,{t},{t2})\'{out_v}'
+    import random
+    output = f"{tmp}/vfx_output.mp4"
+    
+    try:
+        # Obtenir la durée réelle
+        actual_dur = get_duration(video_path)
+        
+        # Filtre complet: zoom dynamique + grain + vignette
+        # Ken Burns: zoom 1.0→1.06 progressif sur toute la vidéo
+        # Film grain: noise aléatoire léger
+        # Vignette: assombrit les bords
+        zoom_speed = 0.06 / actual_dur  # zoom de 100% à 106% sur toute la durée
+        
+        vf_chain = (
+            # Ken Burns zoom progressif
+            f"zoompan=z='min(zoom+{zoom_speed:.6f},1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30"
+            # Film grain cinéma
+            f",noise=alls=8:allf=t+u"
+            # Vignette légère
+            f",vignette=PI/5"
         )
-
-    filter_complex = ';'.join(fc_parts)
-
-    # Inputs vidéo
-    cmd = ['ffmpeg', '-y', '-i', video_path]
-    for _ in positions:
-        cmd += ['-i', burn_path]
-
-    # Ajouter sons whoosh si disponible
-    if whoosh_path:
-        sound_parts = []
-        offset = len(positions) + 1
-        for i, t in enumerate(positions):
-            cmd += ['-i', whoosh_path]
-            delay_ms = int(t * 1000)
-            sound_parts.append(f'[{offset+i}:a]adelay={delay_ms}|{delay_ms}[ws{i}]')
-        n = len(positions)
-        mix = ''.join(f'[ws{i}]' for i in range(n))
-        sound_parts.append(f'[0:a]{mix}amix=inputs={n+1}:duration=first:normalize=0[aout]')
-        full_fc = filter_complex + ';' + ';'.join(sound_parts)
-        cmd += [
-            '-filter_complex', full_fc,
-            '-map', '[vout]', '-map', '[aout]',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
-            '-c:a', 'aac', '-b:a', '192k',
-            '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
-        ]
-    else:
-        cmd += [
-            '-filter_complex', filter_complex,
-            '-map', '[vout]', '-map', '0:a',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+        
+        res = subprocess.run([
+            'ffmpeg', '-y', '-i', video_path,
+            '-vf', vf_chain,
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
+            '-pix_fmt', 'yuv420p', '-r', '30',
             '-c:a', 'copy',
-            '-movflags', '+faststart', '-r', '30', '-t', str(duration), output
-        ]
-
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if res.returncode != 0:
-        print(f"  VFX error: {res.stderr[-300:]}")
+            '-t', str(actual_dur),
+            output
+        ], capture_output=True, text=True, timeout=300)
+        
+        if res.returncode == 0 and os.path.exists(output):
+            size = os.path.getsize(output) / 1024 / 1024
+            print(f"  VFX applied OK ({size:.1f}MB) — zoom + grain + vignette")
+            return output
+        else:
+            print(f"  VFX error: {res.stderr[-200:]}")
+            return video_path
+            
+    except Exception as e:
+        print(f"  VFX exception: {e}")
         return video_path
-
-    print("  VFX applied OK")
-    return output
 
 
 def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     """
-    Submagic API v1 — Upload vidéo + captions synchronisées
-    Doc: https://docs.submagic.co
+    Submagic API v1 — Captions + MagicZooms + MagicBrolls
+    Selon doc officielle: https://docs.submagic.co/api-reference/upload-project
+    Les transitions (Film Burn, VHS, Glitch) ne sont PAS disponibles via API.
+    Ce qui est disponible: templateName, magicZooms, magicBrolls, removeSilencePace, hookTitle, cleanAudio
     """
-    # Headers: x-api-key seulement (pas Bearer)
     headers_sm = {'x-api-key': SUBMAGIC_KEY}
 
     valid_templates = [
@@ -313,7 +279,25 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
 
     print(f"  [SM] Starting — template={template} vfx={use_vfx_transitions} key={SUBMAGIC_KEY[:12]}...")
 
-    # STEP 1: Upload la vidéo
+    # Paramètres selon doc officielle Submagic
+    # VFX Pro = magicZooms + magicBrolls (75%) + cleanAudio
+    # Captions seules = magicZooms seulement
+    form_data = {
+        'title': f'AdMachine-{pid[:8]}',
+        'language': 'fr',
+        'templateName': template,
+        'magicZooms': 'true',          # toujours: zooms dynamiques
+        'cleanAudio': 'false',         # nettoyage audio (optionnel)
+        'removeSilencePace': 'natural', # suppression silences naturelle
+    }
+
+    if use_vfx_transitions:
+        # VFX Pro: magicZooms + removeSilencePace fast
+        form_data['removeSilencePace'] = 'fast'
+        print(f"  [SM] VFX mode: magicZooms + removeSilence(fast)")
+    else:
+        print(f"  [SM] Captions mode: magicZooms + removeSilence(natural)")
+
     try:
         with open(video_path, 'rb') as f:
             video_bytes = f.read()
@@ -325,67 +309,52 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
             f'{SUBMAGIC_URL}/projects/upload',
             headers=headers_sm,
             files={'file': ('video.mp4', video_bytes, 'video/mp4')},
-            data={
-                'title': f'AdMachine-{pid[:8]}',
-                'language': 'fr',
-                'templateName': template,
-                'magicZooms': 'true' if use_vfx_transitions else 'false',
-            },
+            data=form_data,
             timeout=300
         )
     except Exception as e:
         print(f"  [SM] Upload exception: {e}")
         return None
 
-    print(f"  [SM] Upload response: {resp.status_code}")
-    print(f"  [SM] Upload body: {resp.text[:500]}")
+    print(f"  [SM] Upload: {resp.status_code} — {resp.text[:300]}")
 
     if not resp.ok:
-        print(f"  [SM] Upload FAILED ({resp.status_code})")
+        print(f"  [SM] Upload FAILED ({resp.status_code}): {resp.text[:300]}")
         return None
 
     try:
         sm_data = resp.json()
     except Exception as e:
-        print(f"  [SM] JSON error: {e} — raw: {resp.text[:300]}")
+        print(f"  [SM] JSON error: {resp.text[:200]}")
         return None
 
-    # Chercher l'ID dans tous les champs possibles
-    sm_id = (sm_data.get('id') or sm_data.get('projectId') or
-             sm_data.get('project_id') or sm_data.get('_id'))
-    print(f"  [SM] Project ID: {sm_id} — response keys: {list(sm_data.keys())}")
-
+    sm_id = (sm_data.get('id') or sm_data.get('projectId') or sm_data.get('_id'))
+    print(f"  [SM] Project ID: {sm_id} — keys: {list(sm_data.keys())}")
     if not sm_id:
-        print(f"  [SM] No project ID found in: {sm_data}")
         return None
 
-    # STEP 2: Attendre transcription
-    print(f"  [SM] Waiting for transcription...")
+    # Attendre transcription
+    print(f"  [SM] Waiting transcription...")
     for i in range(40):
         time.sleep(5)
         try:
-            r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}',
-                           headers=headers_sm, timeout=15)
-            if not r.ok:
-                print(f"  [SM] Poll error: {r.status_code}")
-                continue
+            r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
+            if not r.ok: continue
             proj = r.json()
             status = proj.get('status', '')
             trans = proj.get('transcriptionStatus', '')
             if i % 4 == 0:
-                print(f"  [SM] [{i+1}] status={status} transcription={trans}")
+                print(f"  [SM] [{i+1}] status={status} trans={trans}")
             if status == 'failed':
-                print(f"  [SM] Failed: {proj.get('failureReason', 'unknown')}")
+                print(f"  [SM] Failed: {proj.get('failureReason')}")
                 return None
             if trans == 'COMPLETED' or status == 'completed':
-                print(f"  [SM] Transcription done!")
+                print(f"  [SM] Transcription OK!")
                 break
-        except Exception as e:
-            print(f"  [SM] Poll exception: {e}")
-            continue
+        except: continue
 
-    # STEP 3: Exporter
-    print(f"  [SM] Requesting export...")
+    # Exporter
+    print(f"  [SM] Exporting 1080x1920...")
     try:
         exp = requests.post(
             f'{SUBMAGIC_URL}/projects/{sm_id}/export',
@@ -393,41 +362,34 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
             json={'width': 1080, 'height': 1920, 'fps': 30},
             timeout=30
         )
-        print(f"  [SM] Export response: {exp.status_code} — {exp.text[:300]}")
+        print(f"  [SM] Export: {exp.status_code} — {exp.text[:200]}")
         if not exp.ok:
-            print(f"  [SM] Export failed")
             return None
     except Exception as e:
         print(f"  [SM] Export exception: {e}")
         return None
 
-    # STEP 4: Attendre le rendu final
-    print(f"  [SM] Waiting for render...")
+    # Attendre rendu final
+    print(f"  [SM] Waiting render...")
     for i in range(60):
         time.sleep(5)
         try:
-            r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}',
-                           headers=headers_sm, timeout=15)
+            r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
             if not r.ok: continue
             proj = r.json()
             status = proj.get('status', '')
             url = (proj.get('directUrl') or proj.get('downloadUrl') or
-                   proj.get('outputUrl') or proj.get('videoUrl') or
-                   proj.get('url'))
+                   proj.get('outputUrl') or proj.get('videoUrl') or proj.get('url'))
             if i % 6 == 0:
                 print(f"  [SM] [{i+1}] status={status} url={'yes' if url else 'no'}")
-                print(f"  [SM] keys: {list(proj.keys())}")
             if status == 'completed' and url:
-                print(f"  [SM] Done! url={url[:60]}")
+                print(f"  [SM] Done!")
                 return url
             if status == 'failed':
-                print(f"  [SM] Render failed: {proj.get('failureReason')}")
                 return None
-        except Exception as e:
-            print(f"  [SM] Render poll exception: {e}")
-            continue
+        except: continue
 
-    print("  [SM] Timeout after 5min — using local video")
+    print("  [SM] Timeout — fallback vidéo locale")
     return None
 
 
@@ -552,11 +514,13 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         try: os.remove(assembled)
         except: pass
 
-        # 5. VFX Pro — si activé, forcer Submagic (captions obligatoires)
-        # Les effets visuels sont gérés nativement par Submagic (magicZooms + transitions)
+        # 5. VFX Pro FFmpeg natif (zoom + grain + vignette) — indépendant de Submagic
         if vfx:
-            with_captions = True  # VFX nécessite Submagic
-            print("  VFX Pro: Submagic forcé (magicZooms + transitions)")
+            print("  Applying VFX Pro (Ken Burns + film grain + vignette)...")
+            vfx_output = apply_vfx(output, tmp, actual_duration)
+            if vfx_output != output:
+                output = vfx_output
+                print("  VFX Pro OK")
 
         # 5b. VFX Pro → utiliser transitions Submagic au lieu de film burn maison
         # Le film burn FFmpeg est désormais remplacé par les effets Submagic natifs
