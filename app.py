@@ -218,10 +218,10 @@ def add_watermark(video_path, tmp, duration, is_free):
 
 def apply_vfx(video_path, tmp, duration):
     """
-    VFX Pro: applique l'overlay filmburn 3 à 5 fois aléatoirement
-    - Fond noir = 100% transparent via blend screen
-    - Audio overlay mixé à 70% du volume
-    - Positions aléatoires dans la vidéo
+    VFX Pro: applique l'overlay filmburn N fois (3-5) à des positions aléatoires.
+    Approche: on loop l'overlay, puis on l'applique en blend=screen sur toute la vidéo.
+    Le fond noir de l'overlay devient transparent via le mode screen.
+    Audio overlay mixé à 70%.
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
@@ -231,97 +231,76 @@ def apply_vfx(video_path, tmp, duration):
         active_overlays = [u for u in VFX_OVERLAYS if u.strip()]
 
         if not active_overlays:
-            print("  [VFX] Aucun overlay configuré — fallback FFmpeg")
+            print("  [VFX] Aucun overlay — fallback")
             raise Exception("no overlay")
 
         overlay_url = random.choice(active_overlays)
         overlay_path = f"{tmp}/vfx_overlay.mp4"
-        print(f"  [VFX] Downloading overlay...")
+        print(f"  [VFX] Downloading {overlay_url[-40:]}...")
         dl(overlay_url, overlay_path)
         overlay_dur = get_duration(overlay_path)
-        print(f"  [VFX] Overlay dur={overlay_dur:.1f}s vidéo={actual_dur:.1f}s")
+        nb = random.randint(3, 5)
+        print(f"  [VFX] overlay={overlay_dur:.1f}s video={actual_dur:.1f}s nb={nb}")
 
-        # Nombre d'applications aléatoire: 3 à 5
-        nb_effects = random.randint(3, 5)
-        print(f"  [VFX] Applying {nb_effects} overlays...")
-
-        # Calculer les positions aléatoires (bien espacées)
-        margin = overlay_dur * 0.5
-        if actual_dur <= overlay_dur * 2:
-            # Vidéo courte: positions réparties uniformément
-            positions = [i * (actual_dur / nb_effects) for i in range(nb_effects)]
+        # Stratégie simple et robuste:
+        # 1. Créer une piste overlay loopée sur toute la durée de la vidéo
+        # 2. Intercaler des silences entre les occurrences pour créer l'effet "N fois"
+        
+        # Calculer l'espacement: nb occurrences dans actual_dur
+        # gap = (actual_dur - nb * overlay_dur) / (nb + 1)  → espacement uniforme
+        gap = max(0.5, (actual_dur - nb * overlay_dur) / (nb + 1))
+        
+        # Créer la piste overlay avec silences (video noire + audio silence entre occurrences)
+        overlay_parts_v = []
+        overlay_parts_a = []
+        
+        for i in range(nb):
+            if gap > 0.1:
+                # Silence vidéo (noir) pour le gap
+                overlay_parts_v.append(
+                    f"[1:v]trim=start=0:duration={gap},setpts=PTS-STARTPTS,geq=r=0:g=0:b=0[gap{i}v]"
+                )
+                overlay_parts_a.append(
+                    f"[1:a]atrim=start=0:duration={gap},asetpts=PTS-STARTPTS,volume=0[gap{i}a]"
+                )
+            overlay_parts_v.append(
+                f"[1:v]trim=start=0:duration={overlay_dur},setpts=PTS-STARTPTS[ov{i}v]"
+            )
+            overlay_parts_a.append(
+                f"[1:a]atrim=start=0:duration={overlay_dur},asetpts=PTS-STARTPTS,volume=0.70[ov{i}a]"
+            )
+        
+        # Concaténer tous les segments overlay
+        if gap > 0.1:
+            v_labels = "".join([f"[gap{i}v][ov{i}v]" for i in range(nb)])
+            a_labels = "".join([f"[gap{i}a][ov{i}a]" for i in range(nb)])
+            n_segs = nb * 2
         else:
-            positions = sorted(random.sample(
-                [round(x * 0.1, 1) for x in range(int(margin*10), int((actual_dur - overlay_dur)*10))],
-                min(nb_effects, int((actual_dur - overlay_dur - margin) * 10))
-            ))[:nb_effects]
-            # Compléter si pas assez
-            while len(positions) < nb_effects:
-                positions.append(round(random.uniform(0, max(0.1, actual_dur - overlay_dur)), 1))
-            positions = sorted(positions[:nb_effects])
-
-        print(f"  [VFX] Positions: {[round(p,1) for p in positions]}")
-
-        # Construire le filtre FFmpeg:
-        # Chaque overlay est appliqué en mode screen à sa position temporelle
-        # avec enable='between(t,start,end)'
-
-        # Input: [0]=vidéo principale, [1]=overlay
-        # On applique chaque instance avec overlay conditionnel
-
-        # Construire filter_complex avec N applications de l'overlay
-        filter_parts = []
-        inputs = ['-i', video_path, '-i', overlay_path]
-
-        # Pour chaque position, on crée un segment de l'overlay
-        overlay_segments = []
-        for i, pos in enumerate(positions):
-            end_pos = pos + overlay_dur
-            seg_label = f"ov{i}"
-            # Prendre l'overlay, le trimmer et le positionner dans le temps
-            filter_parts.append(
-                f"[1:v]setpts=PTS-STARTPTS+{pos}/TB,trim=start=0:duration={overlay_dur}[{seg_label}]"
-            )
-            overlay_segments.append((seg_label, pos, end_pos))
-
-        # Appliquer chaque overlay en blend screen sur la vidéo principale
-        current = "[0:v]"
-        for i, (seg_label, pos, end_pos) in enumerate(overlay_segments):
-            out_label = f"[v{i}]" if i < len(overlay_segments) - 1 else "[vout]"
-            # blend mode screen: fond noir = transparent
-            filter_parts.append(
-                f"{current}[{seg_label}]blend=all_mode=screen:all_opacity=1.0:shortest=0:repeatlast=0"
-                f"{out_label}"
-            )
-            current = f"[v{i}]"
-
-        # Audio: mixer la voix principale + overlay audio à 70%
-        # Créer N segments audio de l'overlay aux mêmes positions
-        audio_parts = []
-        for i, pos in enumerate(positions):
-            audio_parts.append(
-                f"[1:a]adelay={int(pos*1000)}|{int(pos*1000)},atrim=start=0:duration={overlay_dur},volume=0.70[a{i}]"
-            )
-
-        # Mixer tous les audios overlay avec l'audio principal
-        audio_labels = "".join([f"[a{i}]" for i in range(len(positions))])
-        if audio_labels:
-            audio_parts.append(
-                f"[0:a]{audio_labels}amix=inputs={len(positions)+1}:duration=first:normalize=0[aout]"
-            )
-            audio_map = ['-map', '[aout]']
-        else:
-            audio_map = ['-map', '0:a']
-
-        filter_complex = ";".join(filter_parts + audio_parts)
-
+            v_labels = "".join([f"[ov{i}v]" for i in range(nb)])
+            a_labels = "".join([f"[ov{i}a]" for i in range(nb)])
+            n_segs = nb
+        
+        concat_v = f"{v_labels}concat=n={n_segs}:v=1:a=0[ovv_full]"
+        concat_a = f"{a_labels}concat=n={n_segs}:v=0:a=1[ova_full]"
+        
+        # Scaler l'overlay à la taille de la vidéo et appliquer blend screen
+        scale_and_blend = (
+            f"[ovv_full]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[ovv_scaled];"
+            f"[0:v][ovv_scaled]blend=all_mode=screen:all_opacity=1.0:shortest=1[vout]"
+        )
+        
+        # Mixer audio principal + overlay audio
+        mix_audio = f"[0:a][ova_full]amix=inputs=2:duration=first:normalize=0[aout]"
+        
+        all_filters = overlay_parts_v + overlay_parts_a + [concat_v, concat_a, scale_and_blend, mix_audio]
+        filter_complex = ";".join(all_filters)
+        
         res = subprocess.run([
             'ffmpeg', '-y',
             '-i', video_path,
             '-i', overlay_path,
             '-filter_complex', filter_complex,
-            '-map', '[vout]',
-            *audio_map,
+            '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
             '-pix_fmt', 'yuv420p', '-r', '30',
             '-c:a', 'aac', '-b:a', '192k',
@@ -331,10 +310,10 @@ def apply_vfx(video_path, tmp, duration):
 
         if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 10000:
             size = os.path.getsize(output) / 1024 / 1024
-            print(f"  [VFX] OK ({size:.1f}MB) — {nb_effects}x filmburn")
+            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x filmburn screen blend")
             return output
         else:
-            print(f"  [VFX] FFmpeg error: {res.stderr[-400:]}")
+            print(f"  [VFX] FFmpeg error: {res.stderr[-600:]}")
             return video_path
 
     except Exception as e:
@@ -485,7 +464,7 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     return None
 
 
-BREVO_API_KEY = os.environ.get('BREVO_API_KEY', 'xsmtpsib-5811a96c27faef4c4d2faf6a3e073e1a9d33b156dc4c5e4d2abcce9f428c87c4-lrGuMD5V151FhogI')
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
 def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
     """Envoie l'email de notification directement depuis le worker via Brevo."""
