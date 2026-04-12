@@ -479,9 +479,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
             for c in selected: f.write(f"file '{c}'\n")
 
         assembled = f"{tmp}/assembled.mp4"
+        # Ne pas couper ici - on coupera après avoir la durée exacte de la voix
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
-            '-t', str(duration), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
             '-pix_fmt', 'yuv420p', '-r', '30', assembled
         ], check=True, capture_output=True)
         print("  assembled OK")
@@ -515,13 +516,15 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if voice_path: cmd += ['-i', voice_path]; n += 1
         if music_path: cmd += ['-i', music_path]; n += 1
 
-        # Durée réelle = durée de la voix off (priorité) ou duration fixe
+        # Durée réelle = durée exacte de la voix off
         actual_duration = duration
         if voice_path:
             try:
-                actual_duration = get_duration(voice_path)
+                voice_dur = get_duration(voice_path)
+                actual_duration = voice_dur
                 print(f"  voice duration={actual_duration:.1f}s (target={duration}s)")
-            except: pass
+            except Exception as e:
+                print(f"  get_duration error: {e}")
 
         if n == 1:
             cmd += ['-an']
