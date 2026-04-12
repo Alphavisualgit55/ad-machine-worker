@@ -218,113 +218,127 @@ def add_watermark(video_path, tmp, duration, is_free):
 
 def apply_vfx(video_path, tmp, duration):
     """
-    VFX Pro:
-    1. Si VFX_OVERLAYS configuré → télécharger l'overlay et appliquer en mode SCREEN
-       (fond noir = transparent → Film Burn, Glitch, VHS, Light Leak...)
-    2. Fallback → effets FFmpeg natifs (zoom + grain + vignette)
+    VFX Pro: applique l'overlay filmburn 3 à 5 fois aléatoirement
+    - Fond noir = 100% transparent via blend screen
+    - Audio overlay mixé à 70% du volume
+    - Positions aléatoires dans la vidéo
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
 
     try:
         actual_dur = get_duration(video_path)
-
-        # ── OPTION 1: Overlay avec fond noir (mode screen) ──────────────────
         active_overlays = [u for u in VFX_OVERLAYS if u.strip()]
-        if active_overlays:
-            overlay_url = random.choice(active_overlays)
-            overlay_path = f"{tmp}/vfx_overlay.mp4"
-            print(f"  [VFX] Downloading overlay: {overlay_url[:60]}...")
-            try:
-                dl(overlay_url, overlay_path)
-                overlay_dur = get_duration(overlay_path)
-                print(f"  [VFX] Overlay OK ({overlay_dur:.1f}s)")
 
-                # Mode SCREEN: fond noir = transparent
-                # L'overlay est loopé si trop court, coupé si trop long
-                if overlay_dur < actual_dur:
-                    # Looper l'overlay pour couvrir toute la durée
-                    loop_count = int(actual_dur / overlay_dur) + 1
-                    overlay_filter = f"[1:v]loop={loop_count}:size={int(overlay_dur*30)}:start=0,setpts=PTS-STARTPTS,trim=duration={actual_dur},scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[ov]"
-                else:
-                    overlay_filter = f"[1:v]trim=duration={actual_dur},scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[ov]"
+        if not active_overlays:
+            print("  [VFX] Aucun overlay configuré — fallback FFmpeg")
+            raise Exception("no overlay")
 
-                res = subprocess.run([
-                    'ffmpeg', '-y',
-                    '-i', video_path,
-                    '-i', overlay_path,
-                    '-filter_complex',
-                    f"{overlay_filter};"
-                    f"[0:v][ov]blend=all_mode=screen:all_opacity=0.85",
-                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
-                    '-pix_fmt', 'yuv420p', '-r', '30',
-                    '-c:a', 'copy',
-                    '-t', str(actual_dur),
-                    output
-                ], capture_output=True, text=True, timeout=300)
+        overlay_url = random.choice(active_overlays)
+        overlay_path = f"{tmp}/vfx_overlay.mp4"
+        print(f"  [VFX] Downloading overlay...")
+        dl(overlay_url, overlay_path)
+        overlay_dur = get_duration(overlay_path)
+        print(f"  [VFX] Overlay dur={overlay_dur:.1f}s vidéo={actual_dur:.1f}s")
 
-                if res.returncode == 0 and os.path.exists(output):
-                    size = os.path.getsize(output) / 1024 / 1024
-                    print(f"  [VFX] Overlay applied OK ({size:.1f}MB)")
-                    return output
-                else:
-                    print(f"  [VFX] Overlay error: {res.stderr[-200:]} — fallback FFmpeg")
+        # Nombre d'applications aléatoire: 3 à 5
+        nb_effects = random.randint(3, 5)
+        print(f"  [VFX] Applying {nb_effects} overlays...")
 
-            except Exception as e:
-                print(f"  [VFX] Overlay exception: {e} — fallback FFmpeg")
-
-        # ── OPTION 2: Fallback FFmpeg natif ─────────────────────────────────
-        vfx_style = random.choice(['glitch', 'cinematic', 'vintage', 'dynamic'])
-        print(f"  [VFX] Fallback FFmpeg style: {vfx_style}")
-
-        if vfx_style == 'glitch':
-            vf = (
-                "noise=alls=8:allf=t+u,"
-                "vignette=PI/4,"
-                "eq=contrast=1.1:saturation=0.9"
-            )
-        elif vfx_style == 'cinematic':
-            zoom_speed = 0.04 / actual_dur
-            vf = (
-                f"zoompan=z='min(zoom+{zoom_speed:.6f},1.04)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30,"
-                "eq=contrast=1.15:brightness=-0.02:saturation=0.85,"
-                "noise=alls=4:allf=t,"
-                "vignette=PI/3.5"
-            )
-        elif vfx_style == 'vintage':
-            vf = (
-                "eq=contrast=1.1:saturation=0.75,"
-                "noise=alls=10:allf=t+u,"
-                "vignette=PI/3"
-            )
+        # Calculer les positions aléatoires (bien espacées)
+        margin = overlay_dur * 0.5
+        if actual_dur <= overlay_dur * 2:
+            # Vidéo courte: positions réparties uniformément
+            positions = [i * (actual_dur / nb_effects) for i in range(nb_effects)]
         else:
-            zoom_speed = 0.05 / actual_dur
-            vf = (
-                f"zoompan=z='min(zoom+{zoom_speed:.6f},1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30,"
-                "eq=contrast=1.2:saturation=1.1,"
-                "noise=alls=5:allf=t,"
-                "vignette=PI/5"
+            positions = sorted(random.sample(
+                [round(x * 0.1, 1) for x in range(int(margin*10), int((actual_dur - overlay_dur)*10))],
+                min(nb_effects, int((actual_dur - overlay_dur - margin) * 10))
+            ))[:nb_effects]
+            # Compléter si pas assez
+            while len(positions) < nb_effects:
+                positions.append(round(random.uniform(0, max(0.1, actual_dur - overlay_dur)), 1))
+            positions = sorted(positions[:nb_effects])
+
+        print(f"  [VFX] Positions: {[round(p,1) for p in positions]}")
+
+        # Construire le filtre FFmpeg:
+        # Chaque overlay est appliqué en mode screen à sa position temporelle
+        # avec enable='between(t,start,end)'
+
+        # Input: [0]=vidéo principale, [1]=overlay
+        # On applique chaque instance avec overlay conditionnel
+
+        # Construire filter_complex avec N applications de l'overlay
+        filter_parts = []
+        inputs = ['-i', video_path, '-i', overlay_path]
+
+        # Pour chaque position, on crée un segment de l'overlay
+        overlay_segments = []
+        for i, pos in enumerate(positions):
+            end_pos = pos + overlay_dur
+            seg_label = f"ov{i}"
+            # Prendre l'overlay, le trimmer et le positionner dans le temps
+            filter_parts.append(
+                f"[1:v]setpts=PTS-STARTPTS+{pos}/TB,trim=start=0:duration={overlay_dur}[{seg_label}]"
             )
+            overlay_segments.append((seg_label, pos, end_pos))
+
+        # Appliquer chaque overlay en blend screen sur la vidéo principale
+        current = "[0:v]"
+        for i, (seg_label, pos, end_pos) in enumerate(overlay_segments):
+            out_label = f"[v{i}]" if i < len(overlay_segments) - 1 else "[vout]"
+            # blend mode screen: fond noir = transparent
+            filter_parts.append(
+                f"{current}[{seg_label}]blend=all_mode=screen:all_opacity=1.0:shortest=0:repeatlast=0"
+                f"{out_label}"
+            )
+            current = f"[v{i}]"
+
+        # Audio: mixer la voix principale + overlay audio à 70%
+        # Créer N segments audio de l'overlay aux mêmes positions
+        audio_parts = []
+        for i, pos in enumerate(positions):
+            audio_parts.append(
+                f"[1:a]adelay={int(pos*1000)}|{int(pos*1000)},atrim=start=0:duration={overlay_dur},volume=0.70[a{i}]"
+            )
+
+        # Mixer tous les audios overlay avec l'audio principal
+        audio_labels = "".join([f"[a{i}]" for i in range(len(positions))])
+        if audio_labels:
+            audio_parts.append(
+                f"[0:a]{audio_labels}amix=inputs={len(positions)+1}:duration=first:normalize=0[aout]"
+            )
+            audio_map = ['-map', '[aout]']
+        else:
+            audio_map = ['-map', '0:a']
+
+        filter_complex = ";".join(filter_parts + audio_parts)
 
         res = subprocess.run([
-            'ffmpeg', '-y', '-i', video_path,
-            '-vf', vf,
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-i', overlay_path,
+            '-filter_complex', filter_complex,
+            '-map', '[vout]',
+            *audio_map,
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
             '-pix_fmt', 'yuv420p', '-r', '30',
-            '-c:a', 'copy', '-t', str(actual_dur),
+            '-c:a', 'aac', '-b:a', '192k',
+            '-t', str(actual_dur),
             output
-        ], capture_output=True, text=True, timeout=300)
+        ], capture_output=True, text=True, timeout=400)
 
-        if res.returncode == 0 and os.path.exists(output):
+        if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 10000:
             size = os.path.getsize(output) / 1024 / 1024
-            print(f"  [VFX] Fallback OK ({size:.1f}MB) — {vfx_style}")
+            print(f"  [VFX] OK ({size:.1f}MB) — {nb_effects}x filmburn")
             return output
         else:
-            print(f"  [VFX] Fallback error: {res.stderr[-200:]}")
+            print(f"  [VFX] FFmpeg error: {res.stderr[-400:]}")
             return video_path
 
     except Exception as e:
-        print(f"  [VFX] Exception: {e}")
+        print(f"  [VFX] Exception: {e} — vidéo sans overlay")
         return video_path
 
 
