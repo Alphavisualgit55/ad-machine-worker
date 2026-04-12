@@ -485,6 +485,112 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     return None
 
 
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', 'xsmtpsib-5811a96c27faef4c4d2faf6a3e073e1a9d33b156dc4c5e4d2abcce9f428c87c4-lrGuMD5V151FhogI')
+
+def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
+    """Envoie l'email de notification directement depuis le worker via Brevo."""
+    headers = {
+        'apikey': sb_key,
+        'Authorization': f'Bearer {sb_key}',
+        'Content-Type': 'application/json'
+    }
+    
+    # 1. Récupérer l'email de l'user depuis Supabase auth
+    r = requests.get(
+        f"{sb_url}/auth/v1/admin/users/{user_id}",
+        headers=headers, timeout=10
+    )
+    if not r.ok:
+        print(f"  [NOTIF] Cannot get user: {r.status_code}")
+        return
+    
+    user_data = r.json()
+    email = user_data.get('email', '')
+    if not email:
+        print(f"  [NOTIF] No email for user {user_id[:8]}")
+        return
+    
+    # 2. Récupérer le prénom depuis profiles
+    rp = requests.get(
+        f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=first_name",
+        headers={**headers, 'Prefer': 'return=representation'}, timeout=10
+    )
+    first_name = 'là'
+    if rp.ok:
+        profiles = rp.json()
+        if profiles and len(profiles) > 0:
+            first_name = profiles[0].get('first_name') or 'là'
+    
+    # 3. Récupérer la description du projet
+    rj = requests.get(
+        f"{sb_url}/rest/v1/projects?id=eq.{project_id}&select=product_description",
+        headers={**headers, 'Prefer': 'return=representation'}, timeout=10
+    )
+    desc = 'Ton produit'
+    if rj.ok:
+        projects = rj.json()
+        if projects and len(projects) > 0:
+            raw = projects[0].get('product_description', '') or ''
+            desc = raw.replace('#','').replace('*','').replace('`','')[:80]
+    
+    # 4. Envoyer via Brevo
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#050508;font-family:system-ui,sans-serif;">
+  <div style="max-width:600px;margin:0 auto;padding:40px 20px;">
+    <div style="text-align:center;margin-bottom:32px;">
+      <div style="display:inline-flex;align-items:center;gap:10px;">
+        <div style="width:36px;height:36px;background:linear-gradient(135deg,#6366f1,#a855f7);border-radius:10px;display:inline-flex;align-items:center;justify-content:center;">
+          <span style="color:white;font-size:18px;">⚡</span>
+        </div>
+        <span style="color:white;font-size:22px;font-weight:900;">Ad Machine</span>
+      </div>
+    </div>
+    <div style="background:#0d0d14;border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:32px;margin-bottom:24px;">
+      <div style="text-align:center;margin-bottom:24px;">
+        <div style="font-size:48px;margin-bottom:12px;">🎬</div>
+        <h1 style="color:white;font-size:24px;font-weight:900;margin:0 0 8px;">Ta pub est prête !</h1>
+        <p style="color:rgba(255,255,255,0.5);font-size:14px;margin:0;">Bonjour {first_name}, ta publicité vidéo vient d'être générée.</p>
+      </div>
+      <div style="background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);border-radius:12px;padding:16px;margin-bottom:24px;">
+        <p style="color:rgba(255,255,255,0.5);font-size:12px;margin:0 0 4px;text-transform:uppercase;letter-spacing:1px;">Produit</p>
+        <p style="color:white;font-size:14px;margin:0;">{desc}</p>
+      </div>
+      <div style="text-align:center;">
+        <a href="{video_url}" style="display:inline-block;background:linear-gradient(135deg,#6366f1,#a855f7);color:white;text-decoration:none;font-weight:700;font-size:16px;padding:16px 40px;border-radius:14px;">
+          ⬇️ Télécharger ma pub
+        </a>
+      </div>
+    </div>
+    <div style="text-align:center;">
+      <a href="https://admachine.netlify.app/dashboard" style="color:#6366f1;text-decoration:none;font-size:13px;">Voir mon tableau de bord →</a>
+      <p style="color:rgba(255,255,255,0.2);font-size:11px;margin-top:16px;">Ad Machine · admachine.netlify.app</p>
+    </div>
+  </div>
+</body>
+</html>"""
+
+    brevo_res = requests.post(
+        'https://api.brevo.com/v3/smtp/email',
+        headers={
+            'Content-Type': 'application/json',
+            'api-key': BREVO_API_KEY,
+        },
+        json={
+            'sender': {'name': 'Ad Machine', 'email': 'noreply@admachine.netlify.app'},
+            'to': [{'email': email}],
+            'subject': '🎬 Ta pub vidéo Ad Machine est prête !',
+            'htmlContent': html,
+        },
+        timeout=15
+    )
+    
+    print(f"  [NOTIF] Email to {email}: {brevo_res.status_code}")
+    if not brevo_res.ok:
+        print(f"  [NOTIF] Brevo error: {brevo_res.text[:200]}")
+
+
 def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb):
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{pid}] START {duration}s {len(video_urls)} videos vfx={vfx} captions={with_captions} free={is_free}")
@@ -654,18 +760,21 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         sb.update_video(pid, {'video_url': final_url})
         sb.update_project(pid, {'status': 'done'})
 
-        # Notifier l'utilisateur par email si plan Business/Business+
-        if user_id:
+        # Notifier l'utilisateur par email — appel direct Brevo depuis le worker
+        if user_id and sb_url and sb_key:
             try:
-                requests.post(f"{app_url}/api/send-notification", json={
-                    'type': 'video_ready',
-                    'userId': user_id,
-                    'videoUrl': final_url,
-                    'projectId': pid,
-                }, timeout=10)
-                print(f"  Notification sent for user {user_id[:8]}")
+                notify_user_video_ready(user_id, final_url, pid, sb_url, sb_key)
             except Exception as e:
                 print(f"  Notification error (non-blocking): {e}")
+                # Fallback: appel à l'API Netlify
+                try:
+                    requests.post(f"{app_url}/api/send-notification", json={
+                        'type': 'video_ready',
+                        'userId': user_id,
+                        'videoUrl': final_url,
+                        'projectId': pid,
+                    }, timeout=15)
+                except: pass
 
         return final_url
 
