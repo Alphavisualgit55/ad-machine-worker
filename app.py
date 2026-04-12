@@ -218,11 +218,9 @@ def add_watermark(video_path, tmp, duration, is_free):
 
 def apply_vfx(video_path, tmp, duration):
     """
-    VFX Pro: applique l'overlay filmburn N fois (3-5) à des positions aléatoires.
-    - Utilise overlay conditionnel avec enable='between(t,start,end)'
-    - Pas de blend global → pas de filtre rose, pas d'image figée
-    - Format forcé yuv420p sur l'overlay pour éviter les artefacts couleur
-    - Audio overlay à 70% aux positions exactes
+    VFX Pro: overlay filmburn fond noir appliqué N fois.
+    Fond noir = transparent grâce à colorkey ou format RGB + multiply inverse.
+    Utilise overlay filter (pas blend) pour éviter le filtre rose.
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
@@ -230,9 +228,7 @@ def apply_vfx(video_path, tmp, duration):
     try:
         actual_dur = get_duration(video_path)
         active_overlays = [u for u in VFX_OVERLAYS if u.strip()]
-
         if not active_overlays:
-            print("  [VFX] Aucun overlay — skip")
             return video_path
 
         overlay_url = random.choice(active_overlays)
@@ -242,74 +238,80 @@ def apply_vfx(video_path, tmp, duration):
         overlay_dur = get_duration(overlay_path)
         nb = random.randint(3, 5)
 
-        # Positions aléatoires espacées
+        # Positions uniformément espacées + jitter
         spacing = actual_dur / (nb + 1)
         positions = []
         for i in range(nb):
             base = spacing * (i + 1)
-            jitter = random.uniform(-spacing * 0.3, spacing * 0.3)
-            pos = max(0, min(actual_dur - overlay_dur, base + jitter))
-            positions.append(round(pos, 2))
+            jitter = random.uniform(-spacing * 0.25, spacing * 0.25)
+            pos = max(0.0, min(actual_dur - overlay_dur, round(base + jitter, 2)))
+            positions.append(pos)
         positions.sort()
-        print(f"  [VFX] overlay={overlay_dur:.1f}s video={actual_dur:.1f}s nb={nb} pos={positions}")
+        print(f"  [VFX] {nb}x overlay at {positions}")
 
-        # Approche: utiliser overlay filter avec enable
-        # L'overlay est converti en yuv420p et mis en screen via:
-        # colorchannelmixer pour simuler le screen blend manuellement
-        # puis overlay avec enable conditionnel
+        # Étape 1: préparer l'overlay avec fond noir → alpha transparent
+        # On convertit l'overlay en RGBA et on utilise colorkey pour rendre
+        # le noir transparent, puis on overlay sur la vidéo principale
+        overlay_rgba = f"{tmp}/overlay_rgba.mp4"
 
-        # Préparation overlay: scale + format + screen simulation
-        # screen = 1 - (1-a)*(1-b) mais avec overlay fond noir c'est plus simple:
-        # on utilise blend=screen UNIQUEMENT pendant les fenêtres d'apparition
+        # Convertir overlay: noir → transparent via colorkey
+        # colorkey=0x000000:0.2:0.1 rend les pixels proches du noir transparents
+        res_prep = subprocess.run([
+            'ffmpeg', '-y', '-i', overlay_path,
+            '-vf', 'colorkey=0x000000:0.25:0.05,format=yuva420p',
+            '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p',
+            '-an', overlay_rgba
+        ], capture_output=True, text=True, timeout=120)
 
-        # Stratégie: pour chaque position, appliquer overlay avec enable
-        # En utilisant le filtre "overlay" avec blend screen natif
+        if res_prep.returncode != 0:
+            # Fallback: webm ne marche pas → utiliser une autre approche
+            # Approche 2: chromakey via geq pour simuler screen sans blend
+            print(f"  [VFX] colorkey prep failed, using direct screen filter")
+            overlay_rgba = overlay_path
 
-        # Créer la piste overlay normalisée une seule fois
+        # Étape 2: appliquer l'overlay N fois avec enable conditionnel
+        # Chaque occurrence: [overlay]setpts → overlay sur vidéo avec enable
         filter_parts = []
 
-        # Normaliser l'overlay: scale 1080x1920, yuv420p
+        # Préparer l'overlay normalisé (scale uniquement)
         filter_parts.append(
             f"[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-            f"crop=1080:1920,format=yuv420p[ov_norm]"
+            f"crop=1080:1920,format=yuva420p,"
+            f"colorkey=0x000000:0.25:0.05[ov_base]"
         )
 
-        # Pour chaque position: créer un segment overlay avec setpts pour positionner
-        # puis blend conditionnel
-        current_v = "[0:v]"
-        audio_filters = []
-
+        current = "[0:v]"
         for i, pos in enumerate(positions):
             end_pos = round(pos + overlay_dur, 2)
-            out_v = f"[v{i}]" if i < nb - 1 else "[vout]"
-
-            # Overlay positionné: décaler les PTS + activer seulement pendant la fenêtre
+            out = f"[v{i+1}]"
+            # Décaler le PTS de l'overlay pour qu'il commence à 'pos'
             filter_parts.append(
-                f"[ov_norm]setpts=PTS-STARTPTS+{pos}/TB[ov_t{i}]"
+                f"[ov_base]setpts=PTS-STARTPTS+{pos}/TB[ov{i}]"
             )
-            # Blend screen: fond noir overlay devient transparent
-            # enable force le blend seulement dans la fenêtre temporelle
+            # Overlay avec enable: s'affiche seulement entre pos et end_pos
             filter_parts.append(
-                f"{current_v}[ov_t{i}]blend=all_mode=screen:all_opacity=1:"
-                f"enable='between(t,{pos},{end_pos})':shortest=0:repeatlast=0{out_v}"
+                f"{current}[ov{i}]overlay=0:0:"
+                f"enable='between(t,{pos},{end_pos})':format=auto[v{i+1}]"
             )
-            current_v = out_v if i < nb - 1 else "[vout]"
+            current = out
 
-            # Audio: overlay à 70% seulement pendant la fenêtre
-            audio_filters.append(
-                f"[1:a]atrim=start=0:duration={overlay_dur},"
-                f"adelay={int(pos*1000)}|{int(pos*1000)},"
-                f"asetpts=PTS-STARTPTS,volume=0.70[a{i}]"
+        # Renommer le dernier label en [vout]
+        # Remplacer le dernier out_label
+        filter_parts[-1] = filter_parts[-1].replace(f"[v{nb}]", "[vout]")
+
+        # Audio: overlay à 70% aux positions
+        audio_parts = []
+        for i, pos in enumerate(positions):
+            audio_parts.append(
+                f"[1:a]atrim=0:{overlay_dur},asetpts=PTS-STARTPTS,"
+                f"adelay={int(pos*1000)}|{int(pos*1000)},volume=0.70[a{i}]"
             )
-
-        # Mix audio
         a_labels = "".join(f"[a{i}]" for i in range(nb))
-        audio_filters.append(
+        audio_parts.append(
             f"[0:a]{a_labels}amix=inputs={nb+1}:duration=first:normalize=0[aout]"
         )
 
-        all_filters = filter_parts + audio_filters
-        filter_complex = ";".join(all_filters)
+        filter_complex = ";".join(filter_parts + audio_parts)
 
         res = subprocess.run([
             'ffmpeg', '-y',
@@ -326,10 +328,10 @@ def apply_vfx(video_path, tmp, duration):
 
         if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 10000:
             size = os.path.getsize(output) / 1024 / 1024
-            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x overlay screen at {positions}")
+            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x filmburn")
             return output
         else:
-            print(f"  [VFX] FFmpeg error: {res.stderr[-800:]}")
+            print(f"  [VFX] Error: {res.stderr[-600:]}")
             return video_path
 
     except Exception as e:
