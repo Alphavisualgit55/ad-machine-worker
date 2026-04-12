@@ -7,6 +7,15 @@ CORS(app)
 
 SUBMAGIC_KEY = 'sk-b0e3311c51f0d1251a5e43cdb7086fb05fe4cec827a848ad47bd2905a3bb7643'
 SUBMAGIC_URL = 'https://api.submagic.co/v1'
+
+# ─── OVERLAY VFX ─────────────────────────────────────────────────────────────
+# Upload ton overlay (film burn, glitch, VHS...) dans Supabase Storage
+# bucket: videos / dossier: overlays/
+# Le fond NOIR est rendu TRANSPARENT via le mode blend 'screen'
+VFX_OVERLAYS = [
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/filmburn.mp4',
+]
+# ─────────────────────────────────────────────────────────────────────────────
 FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
 
 # Filigrane Ad Machine encodé en base64
@@ -209,54 +218,113 @@ def add_watermark(video_path, tmp, duration, is_free):
 
 def apply_vfx(video_path, tmp, duration):
     """
-    VFX Pro FFmpeg natif:
-    1. Ken Burns zoom dynamique sur chaque clip (zoom-in progressif)
-    2. Flash blanc entre les transitions de clips
-    3. Film grain cinéma
-    4. Vignette légère
+    VFX Pro:
+    1. Si VFX_OVERLAYS configuré → télécharger l'overlay et appliquer en mode SCREEN
+       (fond noir = transparent → Film Burn, Glitch, VHS, Light Leak...)
+    2. Fallback → effets FFmpeg natifs (zoom + grain + vignette)
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
-    
+
     try:
-        # Obtenir la durée réelle
         actual_dur = get_duration(video_path)
-        
-        # Filtre complet: zoom dynamique + grain + vignette
-        # Ken Burns: zoom 1.0→1.06 progressif sur toute la vidéo
-        # Film grain: noise aléatoire léger
-        # Vignette: assombrit les bords
-        zoom_speed = 0.06 / actual_dur  # zoom de 100% à 106% sur toute la durée
-        
-        vf_chain = (
-            # Ken Burns zoom progressif
-            f"zoompan=z='min(zoom+{zoom_speed:.6f},1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30"
-            # Film grain cinéma
-            f",noise=alls=8:allf=t+u"
-            # Vignette légère
-            f",vignette=PI/5"
-        )
-        
+
+        # ── OPTION 1: Overlay avec fond noir (mode screen) ──────────────────
+        active_overlays = [u for u in VFX_OVERLAYS if u.strip()]
+        if active_overlays:
+            overlay_url = random.choice(active_overlays)
+            overlay_path = f"{tmp}/vfx_overlay.mp4"
+            print(f"  [VFX] Downloading overlay: {overlay_url[:60]}...")
+            try:
+                dl(overlay_url, overlay_path)
+                overlay_dur = get_duration(overlay_path)
+                print(f"  [VFX] Overlay OK ({overlay_dur:.1f}s)")
+
+                # Mode SCREEN: fond noir = transparent
+                # L'overlay est loopé si trop court, coupé si trop long
+                if overlay_dur < actual_dur:
+                    # Looper l'overlay pour couvrir toute la durée
+                    loop_count = int(actual_dur / overlay_dur) + 1
+                    overlay_filter = f"[1:v]loop={loop_count}:size={int(overlay_dur*30)}:start=0,setpts=PTS-STARTPTS,trim=duration={actual_dur},scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[ov]"
+                else:
+                    overlay_filter = f"[1:v]trim=duration={actual_dur},scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[ov]"
+
+                res = subprocess.run([
+                    'ffmpeg', '-y',
+                    '-i', video_path,
+                    '-i', overlay_path,
+                    '-filter_complex',
+                    f"{overlay_filter};"
+                    f"[0:v][ov]blend=all_mode=screen:all_opacity=0.85",
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
+                    '-pix_fmt', 'yuv420p', '-r', '30',
+                    '-c:a', 'copy',
+                    '-t', str(actual_dur),
+                    output
+                ], capture_output=True, text=True, timeout=300)
+
+                if res.returncode == 0 and os.path.exists(output):
+                    size = os.path.getsize(output) / 1024 / 1024
+                    print(f"  [VFX] Overlay applied OK ({size:.1f}MB)")
+                    return output
+                else:
+                    print(f"  [VFX] Overlay error: {res.stderr[-200:]} — fallback FFmpeg")
+
+            except Exception as e:
+                print(f"  [VFX] Overlay exception: {e} — fallback FFmpeg")
+
+        # ── OPTION 2: Fallback FFmpeg natif ─────────────────────────────────
+        vfx_style = random.choice(['glitch', 'cinematic', 'vintage', 'dynamic'])
+        print(f"  [VFX] Fallback FFmpeg style: {vfx_style}")
+
+        if vfx_style == 'glitch':
+            vf = (
+                "noise=alls=8:allf=t+u,"
+                "vignette=PI/4,"
+                "eq=contrast=1.1:saturation=0.9"
+            )
+        elif vfx_style == 'cinematic':
+            zoom_speed = 0.04 / actual_dur
+            vf = (
+                f"zoompan=z='min(zoom+{zoom_speed:.6f},1.04)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30,"
+                "eq=contrast=1.15:brightness=-0.02:saturation=0.85,"
+                "noise=alls=4:allf=t,"
+                "vignette=PI/3.5"
+            )
+        elif vfx_style == 'vintage':
+            vf = (
+                "eq=contrast=1.1:saturation=0.75,"
+                "noise=alls=10:allf=t+u,"
+                "vignette=PI/3"
+            )
+        else:
+            zoom_speed = 0.05 / actual_dur
+            vf = (
+                f"zoompan=z='min(zoom+{zoom_speed:.6f},1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30,"
+                "eq=contrast=1.2:saturation=1.1,"
+                "noise=alls=5:allf=t,"
+                "vignette=PI/5"
+            )
+
         res = subprocess.run([
             'ffmpeg', '-y', '-i', video_path,
-            '-vf', vf_chain,
+            '-vf', vf,
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
             '-pix_fmt', 'yuv420p', '-r', '30',
-            '-c:a', 'copy',
-            '-t', str(actual_dur),
+            '-c:a', 'copy', '-t', str(actual_dur),
             output
         ], capture_output=True, text=True, timeout=300)
-        
+
         if res.returncode == 0 and os.path.exists(output):
             size = os.path.getsize(output) / 1024 / 1024
-            print(f"  VFX applied OK ({size:.1f}MB) — zoom + grain + vignette")
+            print(f"  [VFX] Fallback OK ({size:.1f}MB) — {vfx_style}")
             return output
         else:
-            print(f"  VFX error: {res.stderr[-200:]}")
+            print(f"  [VFX] Fallback error: {res.stderr[-200:]}")
             return video_path
-            
+
     except Exception as e:
-        print(f"  VFX exception: {e}")
+        print(f"  [VFX] Exception: {e}")
         return video_path
 
 
