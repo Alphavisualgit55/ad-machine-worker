@@ -83,7 +83,7 @@ def render():
     def run():
         sb = SB(sb_url, sb_key)
         try:
-            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb)
+            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb, sb_url=sb_url, sb_key=sb_key)
             print(f"[{pid}] DONE")
         except Exception as e:
             traceback.print_exc()
@@ -104,7 +104,7 @@ def dl(url, path):
     with open(path, 'wb') as f:
         for chunk in r.iter_content(65536): f.write(chunk)
 
-def get_dur(path):
+def get_duration(path):
     r = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path], capture_output=True, text=True)
     return float(json.loads(r.stdout)['format']['duration'])
 
@@ -570,7 +570,7 @@ def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
         print(f"  [NOTIF] Brevo error: {brevo_res.text[:200]}")
 
 
-def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb):
+def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb, sb_url=None, sb_key=None):
     with tempfile.TemporaryDirectory() as tmp:
         print(f"[{pid}] START {duration}s {len(video_urls)} videos vfx={vfx} captions={with_captions} free={is_free}")
 
@@ -585,7 +585,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 dl(url, src)
                 print(f"  video {i+1} downloaded")
                 clips = []
-                src_dur = get_dur(src)
+                src_dur = get_duration(src)
                 start = 0.0; c_idx = 0
                 while start + 1.5 <= src_dur and c_idx < clips_per_video:
                     out = f"{tmp}/v{i}_c{c_idx:03d}.mp4"
