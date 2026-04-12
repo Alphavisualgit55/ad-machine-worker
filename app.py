@@ -219,9 +219,10 @@ def add_watermark(video_path, tmp, duration, is_free):
 def apply_vfx(video_path, tmp, duration):
     """
     VFX Pro: applique l'overlay filmburn N fois (3-5) à des positions aléatoires.
-    Approche: on loop l'overlay, puis on l'applique en blend=screen sur toute la vidéo.
-    Le fond noir de l'overlay devient transparent via le mode screen.
-    Audio overlay mixé à 70%.
+    - Utilise overlay conditionnel avec enable='between(t,start,end)'
+    - Pas de blend global → pas de filtre rose, pas d'image figée
+    - Format forcé yuv420p sur l'overlay pour éviter les artefacts couleur
+    - Audio overlay à 70% aux positions exactes
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
@@ -231,70 +232,85 @@ def apply_vfx(video_path, tmp, duration):
         active_overlays = [u for u in VFX_OVERLAYS if u.strip()]
 
         if not active_overlays:
-            print("  [VFX] Aucun overlay — fallback")
-            raise Exception("no overlay")
+            print("  [VFX] Aucun overlay — skip")
+            return video_path
 
         overlay_url = random.choice(active_overlays)
         overlay_path = f"{tmp}/vfx_overlay.mp4"
-        print(f"  [VFX] Downloading {overlay_url[-40:]}...")
+        print(f"  [VFX] Downloading overlay...")
         dl(overlay_url, overlay_path)
         overlay_dur = get_duration(overlay_path)
         nb = random.randint(3, 5)
-        print(f"  [VFX] overlay={overlay_dur:.1f}s video={actual_dur:.1f}s nb={nb}")
 
-        # Stratégie simple et robuste:
-        # 1. Créer une piste overlay loopée sur toute la durée de la vidéo
-        # 2. Intercaler des silences entre les occurrences pour créer l'effet "N fois"
-        
-        # Calculer l'espacement: nb occurrences dans actual_dur
-        # gap = (actual_dur - nb * overlay_dur) / (nb + 1)  → espacement uniforme
-        gap = max(0.5, (actual_dur - nb * overlay_dur) / (nb + 1))
-        
-        # Créer la piste overlay avec silences (video noire + audio silence entre occurrences)
-        overlay_parts_v = []
-        overlay_parts_a = []
-        
+        # Positions aléatoires espacées
+        spacing = actual_dur / (nb + 1)
+        positions = []
         for i in range(nb):
-            if gap > 0.1:
-                # Silence vidéo (noir) pour le gap
-                overlay_parts_v.append(
-                    f"[1:v]trim=start=0:duration={gap},setpts=PTS-STARTPTS,geq=r=0:g=0:b=0[gap{i}v]"
-                )
-                overlay_parts_a.append(
-                    f"[1:a]atrim=start=0:duration={gap},asetpts=PTS-STARTPTS,volume=0[gap{i}a]"
-                )
-            overlay_parts_v.append(
-                f"[1:v]trim=start=0:duration={overlay_dur},setpts=PTS-STARTPTS[ov{i}v]"
-            )
-            overlay_parts_a.append(
-                f"[1:a]atrim=start=0:duration={overlay_dur},asetpts=PTS-STARTPTS,volume=0.70[ov{i}a]"
-            )
-        
-        # Concaténer tous les segments overlay
-        if gap > 0.1:
-            v_labels = "".join([f"[gap{i}v][ov{i}v]" for i in range(nb)])
-            a_labels = "".join([f"[gap{i}a][ov{i}a]" for i in range(nb)])
-            n_segs = nb * 2
-        else:
-            v_labels = "".join([f"[ov{i}v]" for i in range(nb)])
-            a_labels = "".join([f"[ov{i}a]" for i in range(nb)])
-            n_segs = nb
-        
-        concat_v = f"{v_labels}concat=n={n_segs}:v=1:a=0[ovv_full]"
-        concat_a = f"{a_labels}concat=n={n_segs}:v=0:a=1[ova_full]"
-        
-        # Scaler l'overlay à la taille de la vidéo et appliquer blend screen
-        scale_and_blend = (
-            f"[ovv_full]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[ovv_scaled];"
-            f"[0:v][ovv_scaled]blend=all_mode=screen:all_opacity=1.0:shortest=1[vout]"
+            base = spacing * (i + 1)
+            jitter = random.uniform(-spacing * 0.3, spacing * 0.3)
+            pos = max(0, min(actual_dur - overlay_dur, base + jitter))
+            positions.append(round(pos, 2))
+        positions.sort()
+        print(f"  [VFX] overlay={overlay_dur:.1f}s video={actual_dur:.1f}s nb={nb} pos={positions}")
+
+        # Approche: utiliser overlay filter avec enable
+        # L'overlay est converti en yuv420p et mis en screen via:
+        # colorchannelmixer pour simuler le screen blend manuellement
+        # puis overlay avec enable conditionnel
+
+        # Préparation overlay: scale + format + screen simulation
+        # screen = 1 - (1-a)*(1-b) mais avec overlay fond noir c'est plus simple:
+        # on utilise blend=screen UNIQUEMENT pendant les fenêtres d'apparition
+
+        # Stratégie: pour chaque position, appliquer overlay avec enable
+        # En utilisant le filtre "overlay" avec blend screen natif
+
+        # Créer la piste overlay normalisée une seule fois
+        filter_parts = []
+
+        # Normaliser l'overlay: scale 1080x1920, yuv420p
+        filter_parts.append(
+            f"[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            f"crop=1080:1920,format=yuv420p[ov_norm]"
         )
-        
-        # Mixer audio principal + overlay audio
-        mix_audio = f"[0:a][ova_full]amix=inputs=2:duration=first:normalize=0[aout]"
-        
-        all_filters = overlay_parts_v + overlay_parts_a + [concat_v, concat_a, scale_and_blend, mix_audio]
+
+        # Pour chaque position: créer un segment overlay avec setpts pour positionner
+        # puis blend conditionnel
+        current_v = "[0:v]"
+        audio_filters = []
+
+        for i, pos in enumerate(positions):
+            end_pos = round(pos + overlay_dur, 2)
+            out_v = f"[v{i}]" if i < nb - 1 else "[vout]"
+
+            # Overlay positionné: décaler les PTS + activer seulement pendant la fenêtre
+            filter_parts.append(
+                f"[ov_norm]setpts=PTS-STARTPTS+{pos}/TB[ov_t{i}]"
+            )
+            # Blend screen: fond noir overlay devient transparent
+            # enable force le blend seulement dans la fenêtre temporelle
+            filter_parts.append(
+                f"{current_v}[ov_t{i}]blend=all_mode=screen:all_opacity=1:"
+                f"enable='between(t,{pos},{end_pos})':shortest=0:repeatlast=0{out_v}"
+            )
+            current_v = out_v if i < nb - 1 else "[vout]"
+
+            # Audio: overlay à 70% seulement pendant la fenêtre
+            audio_filters.append(
+                f"[1:a]atrim=start=0:duration={overlay_dur},"
+                f"adelay={int(pos*1000)}|{int(pos*1000)},"
+                f"asetpts=PTS-STARTPTS,volume=0.70[a{i}]"
+            )
+
+        # Mix audio
+        a_labels = "".join(f"[a{i}]" for i in range(nb))
+        audio_filters.append(
+            f"[0:a]{a_labels}amix=inputs={nb+1}:duration=first:normalize=0[aout]"
+        )
+
+        all_filters = filter_parts + audio_filters
         filter_complex = ";".join(all_filters)
-        
+
         res = subprocess.run([
             'ffmpeg', '-y',
             '-i', video_path,
@@ -310,14 +326,14 @@ def apply_vfx(video_path, tmp, duration):
 
         if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 10000:
             size = os.path.getsize(output) / 1024 / 1024
-            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x filmburn screen blend")
+            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x overlay screen at {positions}")
             return output
         else:
-            print(f"  [VFX] FFmpeg error: {res.stderr[-600:]}")
+            print(f"  [VFX] FFmpeg error: {res.stderr[-800:]}")
             return video_path
 
     except Exception as e:
-        print(f"  [VFX] Exception: {e} — vidéo sans overlay")
+        print(f"  [VFX] Exception: {e}")
         return video_path
 
 
@@ -473,21 +489,39 @@ def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
         'Authorization': f'Bearer {sb_key}',
         'Content-Type': 'application/json'
     }
-    
-    # 1. Récupérer l'email de l'user depuis Supabase auth
-    r = requests.get(
+
+    # 1. Récupérer l'email via l'endpoint admin Supabase (service role requis)
+    # Essayer plusieurs endpoints selon la version Supabase
+    email = None
+    for endpoint in [
         f"{sb_url}/auth/v1/admin/users/{user_id}",
-        headers=headers, timeout=10
-    )
-    if not r.ok:
-        print(f"  [NOTIF] Cannot get user: {r.status_code}")
-        return
-    
-    user_data = r.json()
-    email = user_data.get('email', '')
+        f"{sb_url}/rest/v1/rpc/get_user_email",
+    ]:
+        try:
+            r = requests.get(endpoint, headers=headers, timeout=10)
+            if r.ok:
+                data = r.json()
+                email = data.get('email') or data.get('user', {}).get('email')
+                if email:
+                    break
+        except: continue
+
     if not email:
-        print(f"  [NOTIF] No email for user {user_id[:8]}")
+        # Fallback: chercher dans profiles si email est stocké là
+        rp = requests.get(
+            f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=email",
+            headers=headers, timeout=10
+        )
+        if rp.ok:
+            profiles = rp.json()
+            if profiles:
+                email = profiles[0].get('email')
+
+    if not email:
+        print(f"  [NOTIF] No email found for user {user_id[:8]}")
         return
+
+    print(f"  [NOTIF] Sending to {email[:20]}...")
     
     # 2. Récupérer le prénom depuis profiles
     rp = requests.get(
