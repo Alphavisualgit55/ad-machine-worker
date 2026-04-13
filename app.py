@@ -139,8 +139,8 @@ def add_watermark(video_path, tmp, duration, is_free):
         '-i', wm_path,
         '-filter_complex',
         # Scale watermark à 80% de la largeur, opacité 65%, centré horizontalement en bas
-        '[1:v]format=rgba,colorchannelmixer=aa=0.75[wm];'
-        '[0:v][wm]overlay=(W-w)/2:H-h-30:format=auto[vout]',
+        '[1:v]scale=700:-1,format=rgba,colorchannelmixer=aa=0.80[wm];'
+        '[0:v][wm]overlay=(W-w)/2:(H-h)/2:format=auto[vout]',
         '-map', '[vout]', '-map', '0:a?',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
         '-pix_fmt', 'yuv420p',
