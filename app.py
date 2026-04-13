@@ -14,6 +14,11 @@ SUBMAGIC_URL = 'https://api.submagic.co/v1'
 # Le fond NOIR est rendu TRANSPARENT via le mode blend 'screen'
 VFX_OVERLAYS = [
     'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/filmburn.mp4',
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%201.mp4'
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%202.mp4'
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%203.mp4'
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%204.mp4'
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%205.mp4'
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
