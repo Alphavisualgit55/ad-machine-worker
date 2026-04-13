@@ -73,7 +73,7 @@ def render():
     with_captions = data.get('withCaptions', True)
     is_free      = data.get('isFree', True)
     user_id      = data.get('userId', '')
-    app_url      = data.get('appUrl', 'https://admachine.netlify.app')
+    app_url      = data.get('appUrl', 'https://admachine.io')
     sb_url       = data.get('supabaseUrl')
     sb_key       = data.get('supabaseKey')
 
@@ -461,9 +461,9 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
 BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
 def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
-    """Envoie l'email de notification directement depuis le worker via Brevo."""
+    """Envoie email de notification via Brevo après génération vidéo."""
     if not BREVO_API_KEY:
-        print("  [NOTIF] BREVO_API_KEY non configuré — skip email")
+        print("  [NOTIF] BREVO_API_KEY manquant")
         return
 
     headers_sb = {
@@ -472,107 +472,88 @@ def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
         'Content-Type': 'application/json'
     }
 
-    # 1. Récupérer l'email depuis Supabase auth admin
+    # 1. Email depuis Supabase auth admin
     email = None
     try:
         r = requests.get(
             f"{sb_url}/auth/v1/admin/users/{user_id}",
             headers=headers_sb, timeout=10
         )
-        print(f"  [NOTIF] auth lookup: {r.status_code}")
+        print(f"  [NOTIF] auth: {r.status_code}")
         if r.ok:
-            data = r.json()
-            email = data.get('email')
-            if not email and 'users' in data:
-                email = data['users'][0].get('email') if data['users'] else None
+            email = r.json().get('email')
     except Exception as e:
         print(f"  [NOTIF] auth error: {e}")
 
     if not email:
-        print(f"  [NOTIF] No email for {user_id[:8]}")
+        print(f"  [NOTIF] email introuvable pour {user_id[:8]}")
         return
 
-    print(f"  [NOTIF] Sending to {email}...")
-    
-    # 2. Récupérer le prénom depuis profiles
-    rp = requests.get(
-        f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=first_name",
-        headers={**headers, 'Prefer': 'return=representation'}, timeout=10
-    )
+    # 2. Prénom depuis profiles
     first_name = 'là'
-    if rp.ok:
-        profiles = rp.json()
-        if profiles and len(profiles) > 0:
-            first_name = profiles[0].get('first_name') or 'là'
-    
-    # 3. Récupérer la description du projet
-    rj = requests.get(
-        f"{sb_url}/rest/v1/projects?id=eq.{project_id}&select=product_description",
-        headers={**headers, 'Prefer': 'return=representation'}, timeout=10
-    )
+    try:
+        rp = requests.get(
+            f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=first_name",
+            headers=headers_sb, timeout=10
+        )
+        if rp.ok and rp.json():
+            first_name = rp.json()[0].get('first_name') or 'là'
+    except: pass
+
+    # 3. Description projet
     desc = 'Ton produit'
-    if rj.ok:
-        projects = rj.json()
-        if projects and len(projects) > 0:
-            raw = projects[0].get('product_description', '') or ''
+    try:
+        rj = requests.get(
+            f"{sb_url}/rest/v1/projects?id=eq.{project_id}&select=product_description",
+            headers=headers_sb, timeout=10
+        )
+        if rj.ok and rj.json():
+            raw = rj.json()[0].get('product_description') or ''
             desc = raw.replace('#','').replace('*','').replace('`','')[:80]
-    
+    except: pass
+
     # 4. Envoyer via Brevo
     html = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
+<html><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#050508;font-family:system-ui,sans-serif;">
   <div style="max-width:600px;margin:0 auto;padding:40px 20px;">
     <div style="text-align:center;margin-bottom:32px;">
-      <div style="display:inline-flex;align-items:center;gap:10px;">
-        <div style="width:36px;height:36px;background:linear-gradient(135deg,#6366f1,#a855f7);border-radius:10px;display:inline-flex;align-items:center;justify-content:center;">
-          <span style="color:white;font-size:18px;">⚡</span>
-        </div>
-        <span style="color:white;font-size:22px;font-weight:900;">Ad Machine</span>
+      <div style="background:linear-gradient(135deg,#6366f1,#a855f7);display:inline-flex;align-items:center;gap:10px;padding:10px 20px;border-radius:12px;">
+        <span style="color:white;font-size:20px;font-weight:900;">⚡ Ad Machine</span>
       </div>
     </div>
-    <div style="background:#0d0d14;border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:32px;margin-bottom:24px;">
-      <div style="text-align:center;margin-bottom:24px;">
-        <div style="font-size:48px;margin-bottom:12px;">🎬</div>
-        <h1 style="color:white;font-size:24px;font-weight:900;margin:0 0 8px;">Ta pub est prête !</h1>
-        <p style="color:rgba(255,255,255,0.5);font-size:14px;margin:0;">Bonjour {first_name}, ta publicité vidéo vient d'être générée.</p>
-      </div>
-      <div style="background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);border-radius:12px;padding:16px;margin-bottom:24px;">
-        <p style="color:rgba(255,255,255,0.5);font-size:12px;margin:0 0 4px;text-transform:uppercase;letter-spacing:1px;">Produit</p>
+    <div style="background:#0d0d14;border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:32px;text-align:center;">
+      <div style="font-size:48px;margin-bottom:12px;">🎬</div>
+      <h1 style="color:white;font-size:24px;font-weight:900;margin:0 0 8px;">Ta pub est prête !</h1>
+      <p style="color:rgba(255,255,255,0.5);font-size:14px;margin:0 0 20px;">Bonjour {first_name}, ta vidéo publicitaire vient d'être générée.</p>
+      <div style="background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);border-radius:12px;padding:12px;margin-bottom:24px;">
+        <p style="color:rgba(255,255,255,0.5);font-size:11px;margin:0 0 4px;text-transform:uppercase;">Produit</p>
         <p style="color:white;font-size:14px;margin:0;">{desc}</p>
       </div>
-      <div style="text-align:center;">
-        <a href="{video_url}" style="display:inline-block;background:linear-gradient(135deg,#6366f1,#a855f7);color:white;text-decoration:none;font-weight:700;font-size:16px;padding:16px 40px;border-radius:14px;">
-          ⬇️ Télécharger ma pub
-        </a>
-      </div>
+      <a href="{video_url}" style="display:inline-block;background:linear-gradient(135deg,#6366f1,#a855f7);color:white;text-decoration:none;font-weight:700;font-size:16px;padding:16px 40px;border-radius:14px;">⬇️ Télécharger ma pub</a>
+      <p style="margin-top:20px;"><a href="https://admachine.io/dashboard" style="color:#6366f1;text-decoration:none;font-size:13px;">Voir mon tableau de bord →</a></p>
     </div>
-    <div style="text-align:center;">
-      <a href="https://admachine.netlify.app/dashboard" style="color:#6366f1;text-decoration:none;font-size:13px;">Voir mon tableau de bord →</a>
-      <p style="color:rgba(255,255,255,0.2);font-size:11px;margin-top:16px;">Ad Machine · admachine.netlify.app</p>
-    </div>
+    <p style="text-align:center;color:rgba(255,255,255,0.2);font-size:11px;margin-top:20px;">Ad Machine · admachine.io</p>
   </div>
-</body>
-</html>"""
+</body></html>"""
 
-    brevo_res = requests.post(
-        'https://api.brevo.com/v3/smtp/email',
-        headers={
-            'Content-Type': 'application/json',
-            'api-key': BREVO_API_KEY,
-        },
-        json={
-            'sender': {'name': 'Ad Machine', 'email': 'noreply@admachine.netlify.app'},
-            'to': [{'email': email}],
-            'subject': '🎬 Ta pub vidéo Ad Machine est prête !',
-            'htmlContent': html,
-        },
-        timeout=15
-    )
-    
-    print(f"  [NOTIF] Email to {email}: {brevo_res.status_code}")
-    if not brevo_res.ok:
-        print(f"  [NOTIF] Brevo error: {brevo_res.text[:200]}")
+    try:
+        res = requests.post(
+            'https://api.brevo.com/v3/smtp/email',
+            headers={'Content-Type': 'application/json', 'api-key': BREVO_API_KEY},
+            json={
+                'sender': {'name': 'Ad Machine', 'email': os.environ.get('BREVO_SENDER_EMAIL', 'alphadiagne902@gmail.com')},
+                'to': [{'email': email, 'name': first_name}],
+                'subject': '🎬 Ta pub vidéo Ad Machine est prête !',
+                'htmlContent': html,
+            },
+            timeout=15
+        )
+        print(f"  [NOTIF] Brevo: {res.status_code} → {email}")
+        if not res.ok:
+            print(f"  [NOTIF] Brevo error: {res.text[:200]}")
+    except Exception as e:
+        print(f"  [NOTIF] Brevo exception: {e}")
 
 
 def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb, sb_url=None, sb_key=None):
