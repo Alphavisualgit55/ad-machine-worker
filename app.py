@@ -51,11 +51,11 @@ class SB:
         except: return []
 
     def upload(self, bucket, path, data, ct='video/mp4'):
-        try:
-            h = {'apikey': self.h['apikey'], 'Authorization': self.h['Authorization'], 'Content-Type': ct, 'x-upsert': 'true'}
-            r = requests.post(f"{self.url}/storage/v1/object/{bucket}/{path}", headers=h, data=data, timeout=300)
-            print(f"  SB upload {path}: {r.status_code}")
-        except Exception as e: print(f"  SB upload error: {e}")
+        h = {'apikey': self.h['apikey'], 'Authorization': self.h['Authorization'], 'Content-Type': ct, 'x-upsert': 'true'}
+        r = requests.post(f"{self.url}/storage/v1/object/{bucket}/{path}", headers=h, data=data, timeout=300)
+        print(f"  SB upload {path}: {r.status_code} {r.text[:100]}")
+        if not r.ok:
+            raise Exception(f"Upload failed {r.status_code}: {r.text[:200]}")
 
     def public_url(self, bucket, path):
         return f"{self.url}/storage/v1/object/public/{bucket}/{path}"
@@ -641,13 +641,27 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
             try:
                 sm_local = f"{tmp}/submagic_out.mp4"
                 dl(submagic_url, sm_local)
-                if os.path.exists(sm_local) and os.path.getsize(sm_local) > 10000:
-                    video_final = sm_local
-                    print("  Submagic downloaded OK")
+                sm_size = os.path.getsize(sm_local) if os.path.exists(sm_local) else 0
+                print(f"  Submagic size: {sm_size/1024/1024:.1f}MB ({sm_size} bytes)")
+                
+                if sm_size > 500_000:
+                    # Vérifier que la vidéo est lisible avec ffprobe
+                    probe = subprocess.run(
+                        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', sm_local],
+                        capture_output=True, text=True, timeout=15
+                    )
+                    if probe.returncode == 0 and 'video' in probe.stdout:
+                        video_final = sm_local
+                        print("  Submagic OK et valide")
+                    else:
+                        print(f"  Submagic corrompu (ffprobe failed) — fallback clean_output")
+                        video_final = clean_output
                 else:
-                    print("  Submagic file trop petit — fallback vidéo locale")
+                    print(f"  Submagic trop petit ({sm_size} bytes) — fallback clean_output")
+                    video_final = clean_output
             except Exception as e:
-                print(f"  Submagic download error: {e} — fallback vidéo locale")
+                print(f"  Submagic error: {e} — fallback clean_output")
+                video_final = clean_output
 
         # 7. FILIGRANE
         print(f"  Applying watermark (is_free={is_free})...")
