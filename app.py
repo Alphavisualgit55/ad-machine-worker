@@ -11,16 +11,14 @@ SUBMAGIC_URL = 'https://api.submagic.co/v1'
 # ─── OVERLAY VFX ─────────────────────────────────────────────────────────────
 VFX_OVERLAYS = [
     'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/filmburn.mp4',
-    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%201.mp4',
-    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%202.mp4',
-    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%203.mp4',
-    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%204.mp4',
-    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx%205.mp4',
+    # Ajoute ici tes autres overlays quand tu les uploades dans Supabase Storage
+    # 'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/glitch.mp4',
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
+WATERMARK_URL = 'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/watermark/watermark.png'
 
-WATERMARK_B64 = "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"
+WATERMARK_B64 = ""  # Remplacé par URL Supabase
 
 @app.route('/', methods=['GET'])
 def index():
@@ -126,11 +124,12 @@ def add_watermark(video_path, tmp, duration, is_free):
     output = f"{tmp}/watermarked.mp4"
     wm_path = f"{tmp}/watermark.png"
 
+    # Télécharger le watermark depuis Supabase Storage
     try:
-        with open(wm_path, 'wb') as f:
-            f.write(base64.b64decode(WATERMARK_B64))
+        dl(WATERMARK_URL, wm_path)
+        print("  Watermark downloaded OK")
     except Exception as e:
-        print(f"  Watermark decode error: {e}")
+        print(f"  Watermark download error: {e}")
         return video_path
 
     res = subprocess.run([
@@ -138,7 +137,6 @@ def add_watermark(video_path, tmp, duration, is_free):
         '-i', video_path,
         '-i', wm_path,
         '-filter_complex',
-        # Scale watermark à 80% de la largeur, opacité 65%, centré horizontalement en bas
         '[1:v]scale=1080:-1,format=rgba,colorchannelmixer=aa=0.85[wm];'
         '[0:v][wm]overlay=(W-w)/2:(H-h)/2:format=auto[vout]',
         '-map', '[vout]', '-map', '0:a?',
@@ -159,26 +157,43 @@ def add_watermark(video_path, tmp, duration, is_free):
 def apply_vfx(video_path, tmp, duration):
     """
     VFX Pro: overlay filmburn fond noir, N fois (3-5) à positions aléatoires.
+    - Vérifie que l'overlay existe avant de l'appliquer
     - format=gbrp pour blend screen sans filtre rose
     - split filter pour dupliquer l'overlay en N copies indépendantes
-    - enable='between(t,start,end)' pour cibler les fenêtres exactes
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
 
     try:
         actual_dur = get_duration(video_path)
-        active_overlays = [u for u in VFX_OVERLAYS if u.strip()]
+        active_overlays = [u for u in VFX_OVERLAYS if u.strip() and not u.strip().startswith('#')]
         if not active_overlays:
+            print("  [VFX] Aucun overlay configuré")
             return video_path
 
-        overlay_url = random.choice(active_overlays)
+        # Essayer chaque overlay jusqu'à en trouver un qui marche
         overlay_path = f"{tmp}/vfx_overlay.mp4"
-        print(f"  [VFX] Downloading overlay...")
-        dl(overlay_url, overlay_path)
-        overlay_dur = get_duration(overlay_path)
+        overlay_dur = None
+        random.shuffle(active_overlays)
+        
+        for overlay_url in active_overlays:
+            try:
+                print(f"  [VFX] Trying overlay: {overlay_url[-40:]}")
+                dl(overlay_url, overlay_path)
+                overlay_dur = get_duration(overlay_path)
+                print(f"  [VFX] Overlay OK: {overlay_dur:.1f}s")
+                break
+            except Exception as e:
+                print(f"  [VFX] Overlay failed: {e}")
+                continue
+
+        if not overlay_dur:
+            print("  [VFX] Tous les overlays ont échoué")
+            return video_path
+
         nb = random.randint(3, 5)
 
+        # Positions espacées avec jitter
         spacing = actual_dur / (nb + 1)
         positions = []
         for i in range(nb):
@@ -240,7 +255,7 @@ def apply_vfx(video_path, tmp, duration):
             print(f"  [VFX] OK ({size:.1f}MB) — {nb}x overlay lighten blend")
             return output
         else:
-            print(f"  [VFX] Error: {res.stderr[-600:]}")
+            print(f"  [VFX] FFmpeg error: {res.stderr[-600:]}")
             return video_path
 
     except Exception as e:
