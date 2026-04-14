@@ -11,8 +11,11 @@ SUBMAGIC_URL = 'https://api.submagic.co/v1'
 # ─── OVERLAY VFX ─────────────────────────────────────────────────────────────
 VFX_OVERLAYS = [
     'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/filmburn.mp4',
-    # Ajoute ici tes autres overlays quand tu les uploades dans Supabase Storage
-    # 'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/glitch.mp4',
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx1.mp4',
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx2.mp4',
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx3.mp4',
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx4.mp4',
+    'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx5.mp4',
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
@@ -88,10 +91,20 @@ def render():
             traceback.print_exc()
             print(f"[{pid}] ERROR: {e}")
             try:
+                # Fallback: utiliser la première vidéo source
                 srcs = sb.get_sources(pid)
-                if srcs: sb.update_video(pid, {'video_url': srcs[0]['video_url']})
-                sb.update_project(pid, {'status': 'done'})
-            except: pass
+                if srcs and srcs[0].get('video_url'):
+                    print(f"[{pid}] Fallback: using source video")
+                    sb.update_video(pid, {'video_url': srcs[0]['video_url']})
+                    sb.update_project(pid, {'status': 'done'})
+                else:
+                    # Pas de fallback possible → marquer comme failed
+                    sb.update_project(pid, {'status': 'failed'})
+                    print(f"[{pid}] No fallback available → status=failed")
+            except Exception as e2:
+                print(f"[{pid}] Fallback error: {e2}")
+                try: sb.update_project(pid, {'status': 'failed'})
+                except: pass
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify({'success': True})
@@ -381,7 +394,7 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
                 return None
         except: continue
 
-    print("  [SM] Timeout — fallback vidéo locale")
+    print("  [SM] Timeout après 5min — fallback vidéo locale")
     return None
 
 
@@ -483,11 +496,14 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         print(f"[{pid}] START {duration}s {len(video_urls)} videos vfx={vfx} captions={with_captions} free={is_free}")
 
         clips_needed = math.ceil(duration / 3.0) + 2
-        clips_per_video = math.ceil(clips_needed / max(len(video_urls), 1)) + 2
+        # Assurer au moins 1 clip par vidéo, répartir équitablement
+        nb_videos = len(video_urls)
+        clips_per_video = max(2, math.ceil(clips_needed / max(nb_videos, 1)) + 1)
+        print(f"  Plan: {nb_videos} videos × {clips_per_video} clips = {nb_videos*clips_per_video} clips pour {duration}s")
 
-        # 1. EXTRAIRE CLIPS
+        # 1. EXTRAIRE CLIPS — toutes les vidéos
         clips_by_video = []
-        for i, url in enumerate(video_urls[:8]):
+        for i, url in enumerate(video_urls):  # toutes les vidéos sans limite
             src = f"{tmp}/src_{i}.mp4"
             try:
                 dl(url, src)
@@ -515,11 +531,20 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         if not clips_by_video: raise Exception("No clips extracted")
 
-        # 2. ASSEMBLER
+        # 2. ASSEMBLER — alternance équitable entre toutes les vidéos
         interleaved = interleave_clips(clips_by_video)
         needed = math.ceil(duration / 3.0)
-        selected = [interleaved[i % len(interleaved)] for i in range(needed)]
-        print(f"  {len(selected)} clips interleaved")
+        
+        # S'assurer que toutes les vidéos sont représentées
+        if len(interleaved) >= needed:
+            selected = interleaved[:needed]
+        else:
+            # Répéter en cycle si pas assez de clips
+            selected = [interleaved[i % len(interleaved)] for i in range(needed)]
+        
+        # Log pour vérifier
+        videos_used = len(set(os.path.basename(s).split('_c')[0] for s in selected))
+        print(f"  {len(selected)} clips de {videos_used}/{len(clips_by_video)} vidéos")
 
         concat = f"{tmp}/concat.txt"
         with open(concat, 'w') as f:
@@ -628,16 +653,42 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if is_free:
             video_final = add_watermark(video_final, tmp, duration, is_free)
 
-        # 8. UPLOAD SUPABASE
+        # 8. UPLOAD SUPABASE avec retry
         filename = f"renders/{pid}/ad_machine_{pid[:8]}.mp4"
         print(f"  Uploading to Supabase...")
         with open(video_final, 'rb') as f: video_bytes = f.read()
-        sb.upload('videos', filename, video_bytes)
+        
+        file_size_mb = len(video_bytes) / 1024 / 1024
+        print(f"  File size: {file_size_mb:.1f}MB")
+        
+        upload_ok = False
+        for attempt in range(3):
+            try:
+                sb.upload('videos', filename, video_bytes)
+                upload_ok = True
+                print(f"  Upload OK (attempt {attempt+1})")
+                break
+            except Exception as e:
+                print(f"  Upload attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(3)
+        
+        if not upload_ok:
+            raise Exception("Upload Supabase échoué après 3 tentatives")
+        
         final_url = sb.public_url('videos', filename)
-        print(f"  Upload OK: {final_url[:60]}")
+        print(f"  URL: {final_url[:80]}")
+
+        # Vérifier que l'URL est accessible
+        try:
+            check = requests.head(final_url, timeout=10)
+            print(f"  URL check: {check.status_code}")
+        except Exception as e:
+            print(f"  URL check error (non bloquant): {e}")
 
         sb.update_video(pid, {'video_url': final_url})
         sb.update_project(pid, {'status': 'done'})
+        print(f"  Supabase updated: video_url + status=done")
 
         # 9. NOTIFICATION EMAIL — dans un thread séparé pour ne pas bloquer
         if user_id and sb_url and sb_key:
