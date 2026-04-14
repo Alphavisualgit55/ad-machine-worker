@@ -618,6 +618,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"  mix OK ({size_mb:.1f}MB)")
+        clean_output = output  # Sauvegarder référence vidéo propre avant VFX/watermark
         try: os.remove(assembled)
         except: pass
 
@@ -653,20 +654,30 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if is_free:
             video_final = add_watermark(video_final, tmp, duration, is_free)
 
-        # 8. UPLOAD SUPABASE avec retry
+        # 8. UPLOAD SUPABASE avec vérification taille + retry
         filename = f"renders/{pid}/ad_machine_{pid[:8]}.mp4"
         print(f"  Uploading to Supabase...")
         with open(video_final, 'rb') as f: video_bytes = f.read()
         
         file_size_mb = len(video_bytes) / 1024 / 1024
-        print(f"  File size: {file_size_mb:.1f}MB")
+        print(f"  File size: {file_size_mb:.1f}MB ({len(video_bytes)} bytes)")
+        
+        # Si fichier trop petit (<500KB) → fallback sur vidéo propre avant effets
+        if len(video_bytes) < 500_000:
+            print(f"  WARN: fichier trop petit ({len(video_bytes)} bytes) — fallback clean_output")
+            try:
+                with open(clean_output, 'rb') as f: video_bytes = f.read()
+                file_size_mb = len(video_bytes) / 1024 / 1024
+                print(f"  Fallback OK: {file_size_mb:.1f}MB")
+            except Exception as fe:
+                print(f"  Fallback error: {fe}")
         
         upload_ok = False
         for attempt in range(3):
             try:
                 sb.upload('videos', filename, video_bytes)
                 upload_ok = True
-                print(f"  Upload OK (attempt {attempt+1})")
+                print(f"  Upload OK attempt {attempt+1} ({file_size_mb:.1f}MB)")
                 break
             except Exception as e:
                 print(f"  Upload attempt {attempt+1} failed: {e}")
