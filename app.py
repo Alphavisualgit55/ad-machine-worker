@@ -91,20 +91,9 @@ def render():
             traceback.print_exc()
             print(f"[{pid}] ERROR: {e}")
             try:
-                # Fallback: utiliser la première vidéo source
-                srcs = sb.get_sources(pid)
-                if srcs and srcs[0].get('video_url'):
-                    print(f"[{pid}] Fallback: using source video")
-                    sb.update_video(pid, {'video_url': srcs[0]['video_url']})
-                    sb.update_project(pid, {'status': 'done'})
-                else:
-                    # Pas de fallback possible → marquer comme failed
-                    sb.update_project(pid, {'status': 'failed'})
-                    print(f"[{pid}] No fallback available → status=failed")
-            except Exception as e2:
-                print(f"[{pid}] Fallback error: {e2}")
-                try: sb.update_project(pid, {'status': 'failed'})
-                except: pass
+                sb.update_project(pid, {'status': 'failed'})
+                print(f"[{pid}] status=failed")
+            except: pass
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify({'success': True})
@@ -496,10 +485,11 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         print(f"[{pid}] START {duration}s {len(video_urls)} videos vfx={vfx} captions={with_captions} free={is_free}")
 
         clips_needed = math.ceil(duration / 3.0) + 2
-        # Assurer au moins 1 clip par vidéo, répartir équitablement
         nb_videos = len(video_urls)
-        clips_per_video = max(2, math.ceil(clips_needed / max(nb_videos, 1)) + 1)
-        print(f"  Plan: {nb_videos} videos × {clips_per_video} clips = {nb_videos*clips_per_video} clips pour {duration}s")
+        # Max 3 clips par vidéo pour éviter surcharge mémoire
+        # Avec 10 vidéos × 3 clips = 30 clips = 90s de contenu → largement suffisant
+        clips_per_video = max(1, min(3, math.ceil(clips_needed / max(nb_videos, 1)) + 1))
+        print(f"  Plan: {nb_videos} vidéos × {clips_per_video} clips/vidéo pour {duration}s")
 
         # 1. EXTRAIRE CLIPS — toutes les vidéos
         clips_by_video = []
