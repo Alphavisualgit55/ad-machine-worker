@@ -516,8 +516,9 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     cd = min(3.0, src_dur - start)
                     r = subprocess.run([
                         'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
-                        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1',
-                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p', '-an', out
+                        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30',
+                        '-r', '30', '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+                        '-pix_fmt', 'yuv420p', '-avoid_negative_ts', 'make_zero', '-an', out
                     ], capture_output=True)
                     if r.returncode == 0: clips.append(out)
                     c_idx += 1; start += 3.0
