@@ -100,10 +100,18 @@ def render():
 
 
 def dl(url, path):
-    r = requests.get(url, stream=True, timeout=120)
+    r = requests.get(url, stream=True, timeout=180)
+    if not r.ok:
+        raise Exception(f"HTTP {r.status_code} pour {url[-60:]}")
     r.raise_for_status()
+    size = 0
     with open(path, 'wb') as f:
-        for chunk in r.iter_content(65536): f.write(chunk)
+        for chunk in r.iter_content(65536):
+            f.write(chunk)
+            size += len(chunk)
+    if size == 0:
+        raise Exception(f"Fichier vide téléchargé: {url[-60:]}")
+    print(f"    dl OK: {size/1024:.0f}KB")
 
 def get_duration(path):
     r = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path], capture_output=True, text=True)
@@ -518,7 +526,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 try: os.remove(src)
                 except: pass
             except Exception as e:
-                print(f"  error video {i}: {e}")
+                print(f"  SKIP video {i+1}: {type(e).__name__}: {e}")
 
         if not clips_by_video: raise Exception("No clips extracted")
 
@@ -552,7 +560,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if res_asm.returncode != 0:
             raise Exception(f"Assemblage échoué: {res_asm.stderr[-200:]}")
         asm_dur = get_duration(assembled)
-        print(f"  assembled OK ({asm_dur:.1f}s pour {actual_duration}s voix)")
+        print(f"  assembled OK ({asm_dur:.1f}s pour {duration}s target)")
 
         for clips in clips_by_video:
             for c in clips:
