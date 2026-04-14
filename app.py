@@ -499,30 +499,52 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         clips_per_video = max(1, min(3, math.ceil(clips_needed / max(nb_videos, 1)) + 1))
         print(f"  Plan: {nb_videos} vidéos × {clips_per_video} clips/vidéo pour {duration}s")
 
-        # 1. EXTRAIRE CLIPS — toutes les vidéos
+        # 1. EXTRAIRE CLIPS — positions aléatoires dans chaque vidéo
         clips_by_video = []
-        for i, url in enumerate(video_urls):  # toutes les vidéos sans limite
+        for i, url in enumerate(video_urls):
             src = f"{tmp}/src_{i}.mp4"
             try:
                 dl(url, src)
-                print(f"  video {i+1} downloaded")
-                clips = []
                 src_dur = get_duration(src)
-                start = 0.0; c_idx = 0
-                while start + 1.5 <= src_dur and c_idx < clips_per_video:
-                    out = f"{tmp}/v{i}_c{c_idx:03d}.mp4"
+                print(f"  video {i+1} downloaded ({src_dur:.1f}s)")
+                clips = []
+
+                if src_dur <= 3.0:
+                    # Vidéo très courte → prendre en entier
+                    positions = [0.0]
+                else:
+                    # Générer positions aléatoires réparties sur toute la vidéo
+                    # Diviser la vidéo en segments et choisir 1 point aléatoire par segment
+                    segment_size = src_dur / clips_per_video
+                    positions = []
+                    for seg in range(clips_per_video):
+                        seg_start = seg * segment_size
+                        seg_end = min((seg + 1) * segment_size - 3.0, src_dur - 3.0)
+                        if seg_end > seg_start:
+                            pos = round(random.uniform(seg_start, seg_end), 2)
+                        else:
+                            pos = round(seg_start, 2)
+                        positions.append(pos)
+                    random.shuffle(positions)  # Mélanger pour montage varié
+
+                for c_idx, start in enumerate(positions):
+                    if start + 1.0 > src_dur:
+                        continue
                     cd = min(3.0, src_dur - start)
+                    out = f"{tmp}/v{i}_c{c_idx:03d}.mp4"
                     r = subprocess.run([
                         'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
                         '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30',
                         '-r', '30', '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
                         '-pix_fmt', 'yuv420p', '-avoid_negative_ts', 'make_zero', '-an', out
                     ], capture_output=True)
-                    if r.returncode == 0: clips.append(out)
-                    c_idx += 1; start += 3.0
+                    if r.returncode == 0:
+                        clips.append(out)
+                        print(f"    clip {c_idx+1}: t={start:.1f}s ({cd:.1f}s)")
+
                 if clips:
                     clips_by_video.append(clips)
-                    print(f"  video {i+1}: {len(clips)} clips")
+                    print(f"  video {i+1}: {len(clips)} clips extraits")
                 try: os.remove(src)
                 except: pass
             except Exception as e:
@@ -602,18 +624,21 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if n == 1:
             cmd += ['-an']
         elif n == 2 and voice_path:
-            # Voix sans modification — la vidéo est coupée à la durée exacte de la voix
-            cmd += ['-map', '0:v', '-map', '1:a',
-                    '-c:a', 'aac', '-b:a', '192k', '-ar', '44100']
+            # Voix propre: pas de filtre audio, juste resampling pour stabilité
+            cmd += [
+                '-filter_complex', '[1:a]aresample=44100,asetpts=PTS-STARTPTS[aout]',
+                '-map', '0:v', '-map', '[aout]',
+                '-c:a', 'aac', '-b:a', '192k', '-ar', '44100'
+            ]
         elif n == 2 and music_path:
             cmd += ['-filter_complex',
-                    f'[1:a]volume=0.10,atrim=0:{actual_duration},asetpts=PTS-STARTPTS[a]',
+                    f'[1:a]aresample=44100,volume=0.10,atrim=0:{actual_duration},asetpts=PTS-STARTPTS[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k', '-ar', '44100']
         else:
-            # Voix + musique: voix prioritaire, musique en fond
+            # Voix + musique
             cmd += ['-filter_complex',
-                    f'[1:a]asetpts=PTS-STARTPTS[v];'
-                    f'[2:a]volume=0.08,atrim=0:{actual_duration},asetpts=PTS-STARTPTS[m];'
+                    f'[1:a]aresample=44100,asetpts=PTS-STARTPTS[v];'
+                    f'[2:a]aresample=44100,volume=0.08,atrim=0:{actual_duration},asetpts=PTS-STARTPTS[m];'
                     f'[v][m]amix=inputs=2:duration=first:normalize=0[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k', '-ar', '44100']
 
@@ -677,7 +702,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if is_free:
             video_final = add_watermark(video_final, tmp, duration, is_free)
 
-        # 8. UPLOAD SUPABASE avec vérification taille + retry
+        # 8. UPLOAD SUPABASE avec vérification taille + compression + retry
         filename = f"renders/{pid}/ad_machine_{pid[:8]}.mp4"
         print(f"  Uploading to Supabase...")
         with open(video_final, 'rb') as f: video_bytes = f.read()
@@ -685,15 +710,39 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         file_size_mb = len(video_bytes) / 1024 / 1024
         print(f"  File size: {file_size_mb:.1f}MB ({len(video_bytes)} bytes)")
         
-        # Si fichier trop petit (<500KB) → fallback sur vidéo propre avant effets
+        # Si fichier trop petit (<500KB) → fallback sur vidéo propre
         if len(video_bytes) < 500_000:
-            print(f"  WARN: fichier trop petit ({len(video_bytes)} bytes) — fallback clean_output")
+            print(f"  WARN: fichier trop petit — fallback clean_output")
             try:
                 with open(clean_output, 'rb') as f: video_bytes = f.read()
                 file_size_mb = len(video_bytes) / 1024 / 1024
                 print(f"  Fallback OK: {file_size_mb:.1f}MB")
             except Exception as fe:
                 print(f"  Fallback error: {fe}")
+
+        # Si fichier > 45MB → compresser pour rester sous limite Supabase 50MB
+        if file_size_mb > 45:
+            print(f"  File trop grand ({file_size_mb:.1f}MB) → compression...")
+            compressed = f"{tmp}/compressed.mp4"
+            # Calculer bitrate cible pour 40MB max
+            target_mb = 40
+            vid_dur = get_duration(video_final) if os.path.exists(video_final) else actual_duration
+            target_bitrate = int((target_mb * 8 * 1024) / vid_dur)  # kbps
+            target_bitrate = max(800, min(target_bitrate, 2500))  # entre 800 et 2500 kbps
+            print(f"  Target bitrate: {target_bitrate}kbps pour {vid_dur:.1f}s")
+            res_comp = subprocess.run([
+                'ffmpeg', '-y', '-i', video_final,
+                '-c:v', 'libx264', '-b:v', f'{target_bitrate}k',
+                '-preset', 'fast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart', compressed
+            ], capture_output=True, text=True, timeout=300)
+            if res_comp.returncode == 0 and os.path.exists(compressed):
+                with open(compressed, 'rb') as f: video_bytes = f.read()
+                file_size_mb = len(video_bytes) / 1024 / 1024
+                print(f"  Compressed: {file_size_mb:.1f}MB")
+            else:
+                print(f"  Compression failed: {res_comp.stderr[-100:]}")
         
         upload_ok = False
         last_upload_error = ''
