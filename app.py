@@ -552,12 +552,17 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
             for c in selected: f.write(f"file '{c}'\n")
 
         assembled = f"{tmp}/assembled.mp4"
-        subprocess.run([
+        res_asm = subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-pix_fmt', 'yuv420p', '-r', '30', assembled
-        ], check=True, capture_output=True)
-        print("  assembled OK")
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+            '-pix_fmt', 'yuv420p', '-r', '30',
+            '-vsync', 'cfr',  # Force constant frame rate → évite désync
+            assembled
+        ], capture_output=True, text=True)
+        if res_asm.returncode != 0:
+            raise Exception(f"Assemblage échoué: {res_asm.stderr[-200:]}")
+        asm_dur = get_duration(assembled)
+        print(f"  assembled OK ({asm_dur:.1f}s pour {actual_duration}s voix)")
 
         for clips in clips_by_video:
             for c in clips:
@@ -599,19 +604,24 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if n == 1:
             cmd += ['-an']
         elif n == 2 and voice_path:
-            cmd += ['-map', '0:v', '-map', '1:a', '-c:a', 'aac', '-b:a', '192k']
+            # Voix sans modification — la vidéo est coupée à la durée exacte de la voix
+            cmd += ['-map', '0:v', '-map', '1:a',
+                    '-c:a', 'aac', '-b:a', '192k', '-ar', '44100']
         elif n == 2 and music_path:
-            cmd += ['-filter_complex', f'[1:a]volume=0.10,atrim=0:{actual_duration}[a]',
-                    '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
-        else:
             cmd += ['-filter_complex',
-                    f'[1:a]asetpts=PTS-STARTPTS[v];[2:a]volume=0.10,asetpts=PTS-STARTPTS[m];'
+                    f'[1:a]volume=0.10,atrim=0:{actual_duration},asetpts=PTS-STARTPTS[a]',
+                    '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k', '-ar', '44100']
+        else:
+            # Voix + musique: voix prioritaire, musique en fond
+            cmd += ['-filter_complex',
+                    f'[1:a]asetpts=PTS-STARTPTS[v];'
+                    f'[2:a]volume=0.08,atrim=0:{actual_duration},asetpts=PTS-STARTPTS[m];'
                     f'[v][m]amix=inputs=2:duration=first:normalize=0[a]',
-                    '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k']
+                    '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k', '-ar', '44100']
 
-        cmd += ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
-                '-pix_fmt', 'yuv420p',
-                '-movflags', '+faststart', '-r', '30', '-t', str(actual_duration), output]
+        cmd += ['-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+                '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+                '-r', '30', '-t', str(actual_duration), output]
 
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if res.returncode != 0:
