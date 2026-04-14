@@ -696,6 +696,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 print(f"  Fallback error: {fe}")
         
         upload_ok = False
+        last_upload_error = ''
         for attempt in range(3):
             try:
                 sb.upload('videos', filename, video_bytes)
@@ -703,12 +704,23 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 print(f"  Upload OK attempt {attempt+1} ({file_size_mb:.1f}MB)")
                 break
             except Exception as e:
+                last_upload_error = str(e)
                 print(f"  Upload attempt {attempt+1} failed: {e}")
                 if attempt < 2:
-                    time.sleep(3)
+                    time.sleep(5)
         
         if not upload_ok:
-            raise Exception("Upload Supabase échoué après 3 tentatives")
+            # Dernier recours: essayer avec un nom de fichier différent
+            try:
+                filename2 = f"renders/{pid}/ad_{int(time.time())}.mp4"
+                print(f"  Retry with new filename: {filename2}")
+                sb.upload('videos', filename2, video_bytes)
+                filename = filename2
+                upload_ok = True
+                print(f"  Upload OK with new filename")
+            except Exception as e:
+                print(f"  Final upload attempt failed: {e}")
+                raise Exception(f"Upload Supabase échoué: {last_upload_error}")
         
         final_url = sb.public_url('videos', filename)
         print(f"  URL: {final_url[:80]}")
