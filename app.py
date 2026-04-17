@@ -607,6 +607,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         if not clips_by_video: raise Exception("No clips extracted")
 
+        # Initialiser voice_path avant assemblage (défini plus tard)
+        voice_path = None
+        music_path = None
+
         # 2. ASSEMBLER — rotation intelligente, jamais 2 clips identiques consécutifs
         interleaved = interleave_clips(clips_by_video)
         needed = math.ceil(duration / 3.0)
