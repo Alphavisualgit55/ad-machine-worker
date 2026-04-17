@@ -219,12 +219,11 @@ def add_watermark(video_path, tmp, duration, is_free):
     return video_path
 
 
-def apply_vfx(video_path, tmp, duration):
+def apply_vfx(video_path, tmp, duration, cut_points=None):
     """
-    VFX Pro: overlay filmburn fond noir, N fois (3-5) à positions aléatoires.
-    - Vérifie que l'overlay existe avant de l'appliquer
-    - format=gbrp pour blend screen sans filtre rose
-    - split filter pour dupliquer l'overlay en N copies indépendantes
+    VFX Pro: overlay filmburn à chaque coupure de plan.
+    Si cut_points fournis → transitions exactes aux changements de plan.
+    Sinon → positions espacées régulièrement.
     """
     import random
     output = f"{tmp}/vfx_output.mp4"
@@ -236,38 +235,57 @@ def apply_vfx(video_path, tmp, duration):
             print("  [VFX] Aucun overlay configuré")
             return video_path
 
-        # Essayer chaque overlay jusqu'à en trouver un qui marche
+        # Choisir overlay aléatoire
         overlay_path = f"{tmp}/vfx_overlay.mp4"
         overlay_dur = None
         random.shuffle(active_overlays)
         
         for overlay_url in active_overlays:
             try:
-                print(f"  [VFX] Trying overlay: {overlay_url[-40:]}")
+                print(f"  [VFX] Trying: {overlay_url[-40:]}")
+                r_check = requests.head(overlay_url, timeout=10)
+                print(f"  [VFX] HTTP status: {r_check.status_code}")
+                if r_check.status_code != 200:
+                    print(f"  [VFX] Skip: HTTP {r_check.status_code}")
+                    continue
                 dl(overlay_url, overlay_path)
                 overlay_dur = get_duration(overlay_path)
-                print(f"  [VFX] Overlay OK: {overlay_dur:.1f}s")
+                print(f"  [VFX] Overlay OK ({overlay_dur:.1f}s)")
                 break
             except Exception as e:
-                print(f"  [VFX] Overlay failed: {e}")
+                print(f"  [VFX] Skip {overlay_url[-20:]}: {e}")
                 continue
 
         if not overlay_dur:
             print("  [VFX] Tous les overlays ont échoué")
             return video_path
 
-        nb = random.randint(3, 5)
+        # ── Positions: aux coupures de plan ou espacées ──
+        if cut_points and len(cut_points) > 0:
+            # Centrer l'overlay sur chaque coupure (début overlay = coupe - overlay_dur/2)
+            positions = []
+            for cut in cut_points:
+                pos = max(0.0, min(actual_dur - overlay_dur, round(cut - overlay_dur / 2, 2)))
+                positions.append(pos)
+            # Dédupliquer et trier
+            positions = sorted(list(set([round(p,2) for p in positions])))
+            # Limiter à 8 transitions max
+            if len(positions) > 8:
+                positions = positions[:8]
+            print(f"  [VFX] {len(positions)}x transitions aux coupures: {[round(p,1) for p in positions]}")
+        else:
+            # Fallback: positions espacées
+            nb = min(random.randint(3, 5), max(1, int(actual_dur / 4)))
+            spacing = actual_dur / (nb + 1)
+            positions = []
+            for i in range(nb):
+                pos = max(0.0, min(actual_dur - overlay_dur, round(spacing * (i + 1), 2)))
+                positions.append(pos)
+            print(f"  [VFX] {len(positions)}x overlay espacés: {[round(p,1) for p in positions]}")
 
-        # Positions espacées avec jitter
-        spacing = actual_dur / (nb + 1)
-        positions = []
-        for i in range(nb):
-            base = spacing * (i + 1)
-            jitter = random.uniform(-spacing * 0.25, spacing * 0.25)
-            pos = max(0.0, min(actual_dur - overlay_dur, round(base + jitter, 2)))
-            positions.append(pos)
-        positions.sort()
-        print(f"  [VFX] {nb}x overlay pos={[round(p,1) for p in positions]}")
+        nb = len(positions)
+        if nb == 0:
+            return video_path
 
         filter_parts = [
             "[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
@@ -607,9 +625,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         if not clips_by_video: raise Exception("No clips extracted")
 
-        # Initialiser voice_path avant assemblage (défini plus tard)
+        # Initialiser avant assemblage
         voice_path = None
         music_path = None
+        cut_points = []
 
         # 2. ASSEMBLER — rotation intelligente, jamais 2 clips identiques consécutifs
         interleaved = interleave_clips(clips_by_video)
@@ -771,10 +790,12 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         try: os.remove(assembled)
         except: pass
 
-        # 5. VFX Pro
+        # 5. VFX Pro — aux coupures de plan synchronisées
         if vfx:
-            print("  Applying VFX Pro...")
-            vfx_output = apply_vfx(output, tmp, actual_duration)
+            print("  Applying VFX Pro (transitions aux coupures)...")
+            # Récupérer les coupures détectées (si sync voix activée)
+            vfx_cuts = cut_points if 'cut_points' in dir() and cut_points else None
+            vfx_output = apply_vfx(output, tmp, actual_duration, cut_points=vfx_cuts)
             if vfx_output != output:
                 output = vfx_output
                 print("  VFX Pro OK")
