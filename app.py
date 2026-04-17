@@ -117,6 +117,42 @@ def get_duration(path):
     r = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path], capture_output=True, text=True)
     return float(json.loads(r.stdout)['format']['duration'])
 
+def detect_voice_cuts(voice_path, total_duration):
+    """
+    Détecte les pauses dans la voix pour trouver les bons moments de coupe.
+    Retourne une liste de timestamps (en secondes) où couper les clips.
+    """
+    try:
+        # Détecter les silences dans la voix
+        r = subprocess.run([
+            'ffmpeg', '-y', '-i', voice_path,
+            '-af', 'silencedetect=noise=-35dB:duration=0.3',
+            '-f', 'null', '-'
+        ], capture_output=True, text=True, timeout=30)
+
+        # Parser les silences
+        import re
+        silence_ends = re.findall(r'silence_end: ([0-9.]+)', r.stderr)
+        cuts = [float(t) for t in silence_ends]
+
+        if not cuts:
+            # Pas de silences détectés → coupes régulières toutes les 3s
+            cuts = [i * 3.0 for i in range(1, int(total_duration / 3.0) + 1)]
+            print(f"  [CUTS] Pas de pauses → coupes régulières: {len(cuts)}")
+        else:
+            # Filtrer: garder seulement les coupes espacées d'au moins 2s
+            filtered = [cuts[0]]
+            for t in cuts[1:]:
+                if t - filtered[-1] >= 2.0:
+                    filtered.append(t)
+            cuts = filtered
+            print(f"  [CUTS] {len(cuts)} pauses détectées dans la voix: {[round(t,1) for t in cuts[:8]]}")
+
+        return cuts
+    except Exception as e:
+        print(f"  [CUTS] Erreur détection: {e} → coupes régulières")
+        return [i * 3.0 for i in range(1, int(total_duration / 3.0) + 1)]
+
 def interleave_clips(clips_by_video):
     result = []
     max_len = max(len(c) for c in clips_by_video) if clips_by_video else 0
@@ -134,34 +170,53 @@ def add_watermark(video_path, tmp, duration, is_free):
     output = f"{tmp}/watermarked.mp4"
     wm_path = f"{tmp}/watermark.png"
 
-    # Télécharger le watermark depuis Supabase Storage
+    # Essayer télécharger le watermark PNG
+    wm_downloaded = False
     try:
         dl(WATERMARK_URL, wm_path)
-        print("  Watermark downloaded OK")
+        if os.path.exists(wm_path) and os.path.getsize(wm_path) > 1000:
+            wm_downloaded = True
+            print("  Watermark PNG downloaded OK")
     except Exception as e:
-        print(f"  Watermark download error: {e}")
-        return video_path
+        print(f"  Watermark download error: {e} → fallback texte")
 
-    res = subprocess.run([
-        'ffmpeg', '-y',
-        '-i', video_path,
-        '-i', wm_path,
-        '-filter_complex',
-        '[1:v]scale=1080:-1,format=rgba,colorchannelmixer=aa=0.85[wm];'
-        '[0:v][wm]overlay=(W-w)/2:(H-h)/2:format=auto[vout]',
-        '-map', '[vout]', '-map', '0:a?',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '192k',
-        '-movflags', '+faststart', '-t', str(duration), output
-    ], capture_output=True, text=True, timeout=300)
+    if wm_downloaded:
+        # Appliquer PNG watermark
+        res = subprocess.run([
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-i', wm_path,
+            '-filter_complex',
+            '[1:v]scale=1080:-1,format=rgba,colorchannelmixer=aa=0.85[wm];'
+            '[0:v][wm]overlay=(W-w)/2:(H-h)/2:format=auto[vout]',
+            '-map', '[vout]', '-map', '0:a?',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', '+faststart', '-t', str(duration), output
+        ], capture_output=True, text=True, timeout=300)
+    else:
+        # Fallback: watermark texte FFmpeg garanti
+        res = subprocess.run([
+            'ffmpeg', '-y', '-i', video_path,
+            '-vf', (
+                "drawtext=text='AD MACHINE':fontsize=52:fontcolor=white@0.75:"
+                "x=(w-text_w)/2:y=(h-text_h)/2:"
+                "shadowcolor=black@0.5:shadowx=3:shadowy=3,"
+                "drawtext=text='admachine.io':fontsize=28:fontcolor=white@0.60:"
+                "x=(w-text_w)/2:y=(h-text_h)/2+65:"
+                "shadowcolor=black@0.4:shadowx=2:shadowy=2"
+            ),
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+            '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
+            '-movflags', '+faststart', '-t', str(duration), output
+        ], capture_output=True, text=True, timeout=300)
 
-    if res.returncode != 0:
-        print(f"  Watermark error: {res.stderr[-200:]}")
-        return video_path
+    if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 100000:
+        print("  Watermark added (free) OK")
+        return output
 
-    print("  Watermark added (free) OK")
-    return output
+    print(f"  Watermark error: {res.stderr[-150:]} → vidéo sans watermark")
+    return video_path
 
 
 def apply_vfx(video_path, tmp, duration):
@@ -552,37 +607,93 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         if not clips_by_video: raise Exception("No clips extracted")
 
-        # 2. ASSEMBLER — alternance équitable entre toutes les vidéos
+        # 2. ASSEMBLER — rotation intelligente, jamais 2 clips identiques consécutifs
         interleaved = interleave_clips(clips_by_video)
         needed = math.ceil(duration / 3.0)
-        
-        # S'assurer que toutes les vidéos sont représentées
-        if len(interleaved) >= needed:
-            selected = interleaved[:needed]
-        else:
-            # Répéter en cycle si pas assez de clips
-            selected = [interleaved[i % len(interleaved)] for i in range(needed)]
-        
-        # Log pour vérifier
+        all_clips = list(interleaved)
+
+        # Mélanger les clips de chaque vidéo séparément pour varier
+        random.shuffle(all_clips)
+
+        # Construire la sélection en évitant les répétitions consécutives
+        selected = []
+        last_video = None
+        pool = list(all_clips)  # copie pour cycle
+        used_idx = 0
+
+        for _ in range(needed):
+            # Chercher un clip d'une vidéo différente de la précédente
+            found = False
+            for attempt in range(len(pool)):
+                idx = (used_idx + attempt) % len(pool)
+                clip = pool[idx]
+                clip_video = os.path.basename(clip).split('_c')[0]
+                if clip_video != last_video or len(clips_by_video) == 1:
+                    selected.append(clip)
+                    last_video = clip_video
+                    used_idx = (idx + 1) % len(pool)
+                    found = True
+                    break
+            if not found:
+                # Fallback si impossible d'alterner
+                selected.append(pool[used_idx % len(pool)])
+                used_idx = (used_idx + 1) % len(pool)
+
         videos_used = len(set(os.path.basename(s).split('_c')[0] for s in selected))
-        print(f"  {len(selected)} clips de {videos_used}/{len(clips_by_video)} vidéos")
+        print(f"  {len(selected)} clips de {videos_used}/{len(clips_by_video)} vidéos — alternance OK")
+
+        # ── SYNCHRONISATION VOIX: recalculer durée de chaque clip selon les pauses ──
+        if voice_path and os.path.exists(voice_path):
+            voice_dur_for_cuts = get_duration(voice_path)
+            cut_points = detect_voice_cuts(voice_path, voice_dur_for_cuts)
+
+            # Calculer la durée de chaque segment entre les coupes
+            seg_starts = [0.0] + cut_points
+            seg_durations = []
+            for j in range(len(selected)):
+                if j < len(cut_points):
+                    seg_dur = round(cut_points[j] - seg_starts[j], 2)
+                else:
+                    seg_dur = round(voice_dur_for_cuts - seg_starts[min(j, len(seg_starts)-1)], 2)
+                seg_dur = max(0.5, min(6.0, seg_dur))  # Entre 0.5s et 6s par clip
+                seg_durations.append(seg_dur)
+
+            print(f"  Durées clips synchronisées: {[round(d,1) for d in seg_durations[:8]]}")
+
+            # Re-extraire chaque clip avec la durée exacte du segment
+            synced_clips = []
+            for idx, (clip_path, seg_dur) in enumerate(zip(selected, seg_durations)):
+                synced = f"{tmp}/synced_{idx:03d}.mp4"
+                r = subprocess.run([
+                    'ffmpeg', '-y', '-i', clip_path,
+                    '-t', str(seg_dur),
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+                    '-pix_fmt', 'yuv420p', '-r', '30', '-an', synced
+                ], capture_output=True)
+                if r.returncode == 0 and os.path.exists(synced):
+                    synced_clips.append(synced)
+                else:
+                    synced_clips.append(clip_path)  # fallback clip original
+            selected = synced_clips
+            print(f"  Clips re-découpés selon voix OK")
+        else:
+            print(f"  Pas de voix → clips durée standard 3s")
 
         concat = f"{tmp}/concat.txt"
         with open(concat, 'w') as f:
-            for c in selected: f.write(f"file '{c}'\n")
+            for clip in selected: f.write(f"file '{clip}'\n")
 
         assembled = f"{tmp}/assembled.mp4"
         res_asm = subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
-            '-pix_fmt', 'yuv420p', '-r', '30',
-            '-vsync', 'cfr',  # Force constant frame rate → évite désync
+            '-pix_fmt', 'yuv420p', '-r', '30', '-vsync', 'cfr',
             assembled
         ], capture_output=True, text=True)
         if res_asm.returncode != 0:
             raise Exception(f"Assemblage échoué: {res_asm.stderr[-200:]}")
         asm_dur = get_duration(assembled)
-        print(f"  assembled OK ({asm_dur:.1f}s pour {duration}s target)")
+        print(f"  assembled OK ({asm_dur:.1f}s synchronisé avec voix)")
 
         for clips in clips_by_video:
             for c in clips:
