@@ -8,7 +8,6 @@ CORS(app)
 SUBMAGIC_KEY = 'sk-b0e3311c51f0d1251a5e43cdb7086fb05fe4cec827a848ad47bd2905a3bb7643'
 SUBMAGIC_URL = 'https://api.submagic.co/v1'
 
-# ─── OVERLAY VFX ─────────────────────────────────────────────────────────────
 VFX_OVERLAYS = [
     'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/filmburn.mp4',
     'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx1.mp4',
@@ -17,11 +16,10 @@ VFX_OVERLAYS = [
     'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx4.mp4',
     'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx5.mp4',
 ]
-# ─────────────────────────────────────────────────────────────────────────────
+
 FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
 WATERMARK_URL = 'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/watermark/watermark.png'
-
-WATERMARK_B64 = ""  # Remplacé par URL Supabase
+WATERMARK_B64 = ""
 
 @app.route('/', methods=['GET'])
 def index():
@@ -92,7 +90,6 @@ def render():
             print(f"[{pid}] ERROR: {e}")
             try:
                 sb.update_project(pid, {'status': 'failed'})
-                print(f"[{pid}] status=failed")
             except: pass
 
     threading.Thread(target=run, daemon=True).start()
@@ -110,7 +107,7 @@ def dl(url, path):
             f.write(chunk)
             size += len(chunk)
     if size == 0:
-        raise Exception(f"Fichier vide téléchargé: {url[-60:]}")
+        raise Exception(f"Fichier vide: {url[-60:]}")
     print(f"    dl OK: {size/1024:.0f}KB")
 
 def get_duration(path):
@@ -118,39 +115,25 @@ def get_duration(path):
     return float(json.loads(r.stdout)['format']['duration'])
 
 def detect_voice_cuts(voice_path, total_duration):
-    """
-    Détecte les pauses dans la voix pour trouver les bons moments de coupe.
-    Retourne une liste de timestamps (en secondes) où couper les clips.
-    """
     try:
-        # Détecter les silences dans la voix
         r = subprocess.run([
             'ffmpeg', '-y', '-i', voice_path,
             '-af', 'silencedetect=noise=-35dB:duration=0.3',
             '-f', 'null', '-'
         ], capture_output=True, text=True, timeout=30)
-
-        # Parser les silences
         import re
         silence_ends = re.findall(r'silence_end: ([0-9.]+)', r.stderr)
         cuts = [float(t) for t in silence_ends]
-
         if not cuts:
-            # Pas de silences détectés → coupes régulières toutes les 3s
             cuts = [i * 3.0 for i in range(1, int(total_duration / 3.0) + 1)]
-            print(f"  [CUTS] Pas de pauses → coupes régulières: {len(cuts)}")
         else:
-            # Filtrer: garder seulement les coupes espacées d'au moins 2s
             filtered = [cuts[0]]
             for t in cuts[1:]:
                 if t - filtered[-1] >= 2.0:
                     filtered.append(t)
             cuts = filtered
-            print(f"  [CUTS] {len(cuts)} pauses détectées dans la voix: {[round(t,1) for t in cuts[:8]]}")
-
         return cuts
-    except Exception as e:
-        print(f"  [CUTS] Erreur détection: {e} → coupes régulières")
+    except:
         return [i * 3.0 for i in range(1, int(total_duration / 3.0) + 1)]
 
 def interleave_clips(clips_by_video):
@@ -164,28 +147,20 @@ def interleave_clips(clips_by_video):
 
 def add_watermark(video_path, tmp, duration, is_free):
     if not is_free:
-        print("  Watermark skipped (paid plan)")
         return video_path
-
     output = f"{tmp}/watermarked.mp4"
     wm_path = f"{tmp}/watermark.png"
-
-    # Essayer télécharger le watermark PNG
     wm_downloaded = False
     try:
         dl(WATERMARK_URL, wm_path)
         if os.path.exists(wm_path) and os.path.getsize(wm_path) > 1000:
             wm_downloaded = True
-            print("  Watermark PNG downloaded OK")
     except Exception as e:
-        print(f"  Watermark download error: {e} → fallback texte")
+        print(f"  Watermark download error: {e}")
 
     if wm_downloaded:
-        # Appliquer PNG watermark
         res = subprocess.run([
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-i', wm_path,
+            'ffmpeg', '-y', '-i', video_path, '-i', wm_path,
             '-filter_complex',
             '[1:v]scale=1080:-1,format=rgba,colorchannelmixer=aa=0.85[wm];'
             '[0:v][wm]overlay=(W-w)/2:(H-h)/2:format=auto[vout]',
@@ -195,7 +170,6 @@ def add_watermark(video_path, tmp, duration, is_free):
             '-movflags', '+faststart', '-t', str(duration), output
         ], capture_output=True, text=True, timeout=300)
     else:
-        # Fallback: watermark texte FFmpeg garanti
         res = subprocess.run([
             'ffmpeg', '-y', '-i', video_path,
             '-vf', (
@@ -214,86 +188,57 @@ def add_watermark(video_path, tmp, duration, is_free):
     if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 100000:
         print("  Watermark added (free) OK")
         return output
-
-    print(f"  Watermark error: {res.stderr[-150:]} → vidéo sans watermark")
     return video_path
 
 
 def apply_vfx(video_path, tmp, duration, cut_points=None):
-    """
-    VFX Pro: overlay filmburn à chaque coupure de plan.
-    Si cut_points fournis → transitions exactes aux changements de plan.
-    Sinon → positions espacées régulièrement.
-    """
-    import random
     output = f"{tmp}/vfx_output.mp4"
-
     try:
         actual_dur = get_duration(video_path)
-        active_overlays = [u for u in VFX_OVERLAYS if u.strip() and not u.strip().startswith('#')]
+        active_overlays = [u for u in VFX_OVERLAYS if u.strip()]
         if not active_overlays:
-            print("  [VFX] Aucun overlay configuré")
             return video_path
 
-        # Choisir overlay aléatoire
         overlay_path = f"{tmp}/vfx_overlay.mp4"
         overlay_dur = None
         random.shuffle(active_overlays)
-        
+
         for overlay_url in active_overlays:
             try:
-                print(f"  [VFX] Trying: {overlay_url[-40:]}")
                 r_check = requests.head(overlay_url, timeout=10)
-                print(f"  [VFX] HTTP status: {r_check.status_code}")
                 if r_check.status_code != 200:
-                    print(f"  [VFX] Skip: HTTP {r_check.status_code}")
                     continue
                 dl(overlay_url, overlay_path)
                 overlay_dur = get_duration(overlay_path)
-                print(f"  [VFX] Overlay OK ({overlay_dur:.1f}s)")
                 break
-            except Exception as e:
-                print(f"  [VFX] Skip {overlay_url[-20:]}: {e}")
+            except:
                 continue
 
         if not overlay_dur:
-            print("  [VFX] Tous les overlays ont échoué")
             return video_path
 
-        # ── Positions: aux coupures de plan ou espacées ──
         if cut_points and len(cut_points) > 0:
-            # Centrer l'overlay sur chaque coupure (début overlay = coupe - overlay_dur/2)
             positions = []
             for cut in cut_points:
                 pos = max(0.0, min(actual_dur - overlay_dur, round(cut - overlay_dur / 2, 2)))
                 positions.append(pos)
-            # Dédupliquer et trier
             positions = sorted(list(set([round(p,2) for p in positions])))
-            # Limiter à 8 transitions max
             if len(positions) > 8:
                 positions = positions[:8]
-            print(f"  [VFX] {len(positions)}x transitions aux coupures: {[round(p,1) for p in positions]}")
         else:
-            # Fallback: positions espacées
             nb = min(random.randint(3, 5), max(1, int(actual_dur / 4)))
             spacing = actual_dur / (nb + 1)
-            positions = []
-            for i in range(nb):
-                pos = max(0.0, min(actual_dur - overlay_dur, round(spacing * (i + 1), 2)))
-                positions.append(pos)
-            print(f"  [VFX] {len(positions)}x overlay espacés: {[round(p,1) for p in positions]}")
+            positions = [max(0.0, min(actual_dur - overlay_dur, round(spacing * (i + 1), 2))) for i in range(nb)]
 
         nb = len(positions)
         if nb == 0:
             return video_path
 
         filter_parts = [
-            "[1:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920,format=gbrp[ovbase]",
+            "[1:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,format=gbrp[ovbase]",
             f"[ovbase]split={nb}" + "".join(f"[ovcopy{i}]" for i in range(nb)),
             "[0:v]format=gbrp[mainv]"
         ]
-
         current = "[mainv]"
         for i, pos in enumerate(positions):
             end_pos = round(pos + overlay_dur, 2)
@@ -304,7 +249,6 @@ def apply_vfx(video_path, tmp, duration, cut_points=None):
                 f"enable='between(t,{pos},{end_pos})':shortest=0:repeatlast=0{out}"
             )
             current = out
-
         filter_parts.append(f"[v{nb}]format=yuv420p[vout]")
 
         audio_parts = []
@@ -314,79 +258,53 @@ def apply_vfx(video_path, tmp, duration, cut_points=None):
                 f"adelay={int(pos*1000)}|{int(pos*1000)},volume=0.70[a{i}]"
             )
         a_labels = "".join(f"[a{i}]" for i in range(nb))
-        audio_parts.append(
-            f"[0:a]{a_labels}amix=inputs={nb+1}:duration=first:normalize=0[aout]"
-        )
+        audio_parts.append(f"[0:a]{a_labels}amix=inputs={nb+1}:duration=first:normalize=0[aout]")
 
         filter_complex = ";".join(filter_parts + audio_parts)
-
         res = subprocess.run([
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-i', overlay_path,
+            'ffmpeg', '-y', '-i', video_path, '-i', overlay_path,
             '-filter_complex', filter_complex,
             '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
             '-pix_fmt', 'yuv420p', '-r', '30',
             '-c:a', 'aac', '-b:a', '192k',
-            '-t', str(actual_dur),
-            output
+            '-t', str(actual_dur), output
         ], capture_output=True, text=True, timeout=400)
 
         if res.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 10000:
-            size = os.path.getsize(output) / 1024 / 1024
-            print(f"  [VFX] OK ({size:.1f}MB) — {nb}x overlay lighten blend")
             return output
-        else:
-            print(f"  [VFX] FFmpeg error: {res.stderr[-600:]}")
-            return video_path
-
-    except Exception as e:
-        print(f"  [VFX] Exception: {e}")
+        return video_path
+    except:
         return video_path
 
 
 def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     headers_sm = {'x-api-key': SUBMAGIC_KEY}
-
     valid_templates = [
         'Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
         'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
         'Daniel','Dan','Dan 2','Devin','Tayo','Jason','Noah',
         'Kelly','Kelly 2','William','Mia','Tom','Zoe'
     ]
-    template_map = {
-        'Kelly 2': 'Kelly 2',
-        'Dan 2': 'Dan 2',
-        'William': 'William',
-    }
+    template_map = {'Kelly 2':'Kelly 2','Dan 2':'Dan 2','William':'William'}
     template = template_map.get(template, template)
     if template not in valid_templates:
-        print(f"  [SM] Template '{template}' inconnu → Hormozi 2")
         template = 'Hormozi 2'
 
-    print(f"  [SM] Starting — template={template} vfx={use_vfx_transitions} key={SUBMAGIC_KEY[:12]}...")
-
+    print(f"  [SM] Starting — template={template}")
     form_data = {
         'title': f'AdMachine-{pid[:8]}',
         'language': 'fr',
         'templateName': template,
         'magicZooms': 'true',
         'cleanAudio': 'false',
-        'removeSilencePace': 'natural',
+        'removeSilencePace': 'fast' if use_vfx_transitions else 'natural',
     }
-
-    if use_vfx_transitions:
-        form_data['removeSilencePace'] = 'fast'
-        print(f"  [SM] VFX mode: magicZooms + removeSilence(fast)")
-    else:
-        print(f"  [SM] Captions mode: magicZooms + removeSilence(natural)")
 
     try:
         with open(video_path, 'rb') as f:
             video_bytes = f.read()
-        file_size = len(video_bytes)
-        print(f"  [SM] Uploading {file_size/1024/1024:.1f}MB...")
+        print(f"  [SM] Uploading {len(video_bytes)/1024/1024:.1f}MB...")
         resp = requests.post(
             f'{SUBMAGIC_URL}/projects/upload',
             headers=headers_sm,
@@ -398,7 +316,6 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
         print(f"  [SM] Upload exception: {e}")
         return None
 
-    print(f"  [SM] Upload: {resp.status_code} — {resp.text[:300]}")
     if not resp.ok:
         return None
 
@@ -407,12 +324,10 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     except:
         return None
 
-    sm_id = (sm_data.get('id') or sm_data.get('projectId') or sm_data.get('_id'))
-    print(f"  [SM] Project ID: {sm_id}")
+    sm_id = sm_data.get('id') or sm_data.get('projectId') or sm_data.get('_id')
     if not sm_id:
         return None
 
-    print(f"  [SM] Waiting transcription...")
     for i in range(40):
         time.sleep(5)
         try:
@@ -421,16 +336,12 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
             proj = r.json()
             status = proj.get('status', '')
             trans = proj.get('transcriptionStatus', '')
-            if i % 4 == 0:
-                print(f"  [SM] [{i+1}] status={status} trans={trans}")
-            if status == 'failed':
-                return None
+            if status == 'failed': return None
             if trans == 'COMPLETED' or status == 'completed':
                 print(f"  [SM] Transcription OK!")
                 break
         except: continue
 
-    print(f"  [SM] Exporting 1080x1920...")
     try:
         exp = requests.post(
             f'{SUBMAGIC_URL}/projects/{sm_id}/export',
@@ -438,14 +349,10 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
             json={'width': 1080, 'height': 1920, 'fps': 30},
             timeout=30
         )
-        print(f"  [SM] Export: {exp.status_code}")
-        if not exp.ok:
-            return None
-    except Exception as e:
-        print(f"  [SM] Export exception: {e}")
+        if not exp.ok: return None
+    except:
         return None
 
-    print(f"  [SM] Waiting render...")
     for i in range(60):
         time.sleep(5)
         try:
@@ -455,92 +362,62 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
             status = proj.get('status', '')
             url = (proj.get('directUrl') or proj.get('downloadUrl') or
                    proj.get('outputUrl') or proj.get('videoUrl') or proj.get('url'))
-            if i % 6 == 0:
-                print(f"  [SM] [{i+1}] status={status} url={'yes' if url else 'no'}")
             if status == 'completed' and url:
                 print(f"  [SM] Done!")
                 return url
-            if status == 'failed':
-                return None
+            if status == 'failed': return None
         except: continue
 
-    print("  [SM] Timeout après 5min — fallback vidéo locale")
     return None
 
 
 BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
 def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
-    if not BREVO_API_KEY:
-        print("  [NOTIF] BREVO_API_KEY manquant")
-        return
-
-    headers_sb = {
-        'apikey': sb_key,
-        'Authorization': f'Bearer {sb_key}',
-        'Content-Type': 'application/json'
-    }
-
+    if not BREVO_API_KEY: return
+    headers_sb = {'apikey': sb_key, 'Authorization': f'Bearer {sb_key}', 'Content-Type': 'application/json'}
     email = None
     try:
-        r = requests.get(
-            f"{sb_url}/auth/v1/admin/users/{user_id}",
-            headers=headers_sb, timeout=10
-        )
+        r = requests.get(f"{sb_url}/auth/v1/admin/users/{user_id}", headers=headers_sb, timeout=10)
         print(f"  [NOTIF] auth: {r.status_code}")
-        if r.ok:
-            email = r.json().get('email')
-    except Exception as e:
-        print(f"  [NOTIF] auth error: {e}")
+        if r.ok: email = r.json().get('email')
+    except: pass
 
-    if not email:
-        print(f"  [NOTIF] email introuvable pour {user_id[:8]}")
-        return
+    if not email: return
 
     first_name = 'là'
     try:
-        rp = requests.get(
-            f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=first_name",
-            headers=headers_sb, timeout=10
-        )
-        if rp.ok and rp.json():
-            first_name = rp.json()[0].get('first_name') or 'là'
+        rp = requests.get(f"{sb_url}/rest/v1/profiles?id=eq.{user_id}&select=first_name", headers=headers_sb, timeout=10)
+        if rp.ok and rp.json(): first_name = rp.json()[0].get('first_name') or 'là'
     except: pass
 
     desc = 'Ton produit'
     try:
-        rj = requests.get(
-            f"{sb_url}/rest/v1/projects?id=eq.{project_id}&select=product_description",
-            headers=headers_sb, timeout=10
-        )
+        rj = requests.get(f"{sb_url}/rest/v1/projects?id=eq.{project_id}&select=product_description", headers=headers_sb, timeout=10)
         if rj.ok and rj.json():
             raw = rj.json()[0].get('product_description') or ''
             desc = raw.replace('#','').replace('*','').replace('`','')[:80]
     except: pass
 
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#050508;font-family:system-ui,sans-serif;">
-  <div style="max-width:600px;margin:0 auto;padding:40px 20px;">
-    <div style="text-align:center;margin-bottom:32px;">
-      <div style="background:linear-gradient(135deg,#6366f1,#a855f7);display:inline-flex;align-items:center;gap:10px;padding:10px 20px;border-radius:12px;">
-        <span style="color:white;font-size:20px;font-weight:900;">⚡ Ad Machine</span>
-      </div>
+    html = f"""<div style="background:#050508;padding:40px;font-family:system-ui;color:white;max-width:520px;margin:0 auto;border-radius:20px">
+  <div style="text-align:center;margin-bottom:24px">
+    <div style="background:linear-gradient(135deg,#6366f1,#a855f7);display:inline-block;padding:10px 20px;border-radius:12px">
+      <span style="color:white;font-size:18px;font-weight:900">⚡ Ad Machine</span>
     </div>
-    <div style="background:#0d0d14;border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:32px;text-align:center;">
-      <div style="font-size:48px;margin-bottom:12px;">🎬</div>
-      <h1 style="color:white;font-size:24px;font-weight:900;margin:0 0 8px;">Ta pub est prête !</h1>
-      <p style="color:rgba(255,255,255,0.5);font-size:14px;margin:0 0 20px;">Bonjour {first_name}, ta vidéo publicitaire vient d'être générée.</p>
-      <div style="background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);border-radius:12px;padding:12px;margin-bottom:24px;">
-        <p style="color:rgba(255,255,255,0.5);font-size:11px;margin:0 0 4px;text-transform:uppercase;">Produit</p>
-        <p style="color:white;font-size:14px;margin:0;">{desc}</p>
-      </div>
-      <a href="{video_url}" style="display:inline-block;background:linear-gradient(135deg,#6366f1,#a855f7);color:white;text-decoration:none;font-weight:700;font-size:16px;padding:16px 40px;border-radius:14px;">⬇️ Télécharger ma pub</a>
-      <p style="margin-top:20px;"><a href="https://admachine.io/dashboard" style="color:#6366f1;text-decoration:none;font-size:13px;">Voir mon tableau de bord →</a></p>
-    </div>
-    <p style="text-align:center;color:rgba(255,255,255,0.2);font-size:11px;margin-top:20px;">Ad Machine · admachine.io</p>
   </div>
-</body></html>"""
+  <div style="background:#0d0d14;border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:28px;text-align:center">
+    <div style="font-size:44px;margin-bottom:10px">🎬</div>
+    <h1 style="color:white;font-size:22px;font-weight:900;margin:0 0 8px">Ta pub est prête !</h1>
+    <p style="color:rgba(255,255,255,0.5);font-size:14px;margin:0 0 16px">Bonjour {first_name}, ta vidéo publicitaire vient d'être générée.</p>
+    <div style="background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);border-radius:10px;padding:10px;margin-bottom:20px">
+      <p style="color:rgba(255,255,255,0.5);font-size:11px;margin:0 0 3px;text-transform:uppercase">Produit</p>
+      <p style="color:white;font-size:13px;margin:0">{desc}</p>
+    </div>
+    <a href="{video_url}" style="display:inline-block;background:linear-gradient(135deg,#6366f1,#a855f7);color:white;text-decoration:none;font-weight:700;font-size:15px;padding:14px 36px;border-radius:12px">⬇️ Télécharger ma pub</a>
+    <p style="margin-top:16px"><a href="https://admachine.io/dashboard" style="color:#6366f1;text-decoration:none;font-size:12px">Voir mon tableau de bord →</a></p>
+  </div>
+  <p style="text-align:center;color:rgba(255,255,255,0.15);font-size:11px;margin-top:16px">Ad Machine · admachine.io</p>
+</div>"""
 
     try:
         res = requests.post(
@@ -555,8 +432,6 @@ def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
             timeout=15
         )
         print(f"  [NOTIF] Brevo: {res.status_code} → {email}")
-        if not res.ok:
-            print(f"  [NOTIF] Brevo error: {res.text[:200]}")
     except Exception as e:
         print(f"  [NOTIF] Brevo exception: {e}")
 
@@ -567,12 +442,10 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         clips_needed = math.ceil(duration / 3.0) + 2
         nb_videos = len(video_urls)
-        # Max 3 clips par vidéo pour éviter surcharge mémoire
-        # Avec 10 vidéos × 3 clips = 30 clips = 90s de contenu → largement suffisant
         clips_per_video = max(1, min(3, math.ceil(clips_needed / max(nb_videos, 1)) + 1))
         print(f"  Plan: {nb_videos} vidéos × {clips_per_video} clips/vidéo pour {duration}s")
 
-        # 1. EXTRAIRE CLIPS — positions aléatoires dans chaque vidéo
+        # 1. EXTRAIRE CLIPS
         clips_by_video = []
         for i, url in enumerate(video_urls):
             src = f"{tmp}/src_{i}.mp4"
@@ -583,22 +456,24 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 clips = []
 
                 if src_dur <= 3.0:
-                    # Vidéo très courte → prendre en entier
                     positions = [0.0]
                 else:
-                    # Générer positions aléatoires réparties sur toute la vidéo
-                    # Diviser la vidéo en segments et choisir 1 point aléatoire par segment
-                    segment_size = src_dur / clips_per_video
+                    # Calculer combien de clips on peut vraiment extraire de cette vidéo
+                    max_possible = max(1, int(src_dur / 2.5))  # 1 clip toutes les 2.5s
+                    actual_clips = min(clips_per_video, max_possible)
+                    # Diviser la vidéo en segments égaux et prendre 1 position par segment
+                    # → garantit que toute la vidéo est couverte sans répétition
+                    segment_size = src_dur / actual_clips
                     positions = []
-                    for seg in range(clips_per_video):
+                    for seg in range(actual_clips):
                         seg_start = seg * segment_size
-                        seg_end = min((seg + 1) * segment_size - 3.0, src_dur - 3.0)
+                        seg_end = min(seg_start + segment_size - 3.0, src_dur - 3.0)
                         if seg_end > seg_start:
                             pos = round(random.uniform(seg_start, seg_end), 2)
                         else:
-                            pos = round(seg_start, 2)
+                            pos = max(0.0, round(seg_start, 2))
                         positions.append(pos)
-                    random.shuffle(positions)  # Mélanger pour montage varié
+                    print(f"  video {i+1}: {len(positions)} positions sur {src_dur:.1f}s")
 
                 for c_idx, start in enumerate(positions):
                     if start + 1.0 > src_dur:
@@ -621,56 +496,53 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 try: os.remove(src)
                 except: pass
             except Exception as e:
-                print(f"  SKIP video {i+1}: {type(e).__name__}: {e}")
+                print(f"  SKIP video {i+1}: {e}")
 
         if not clips_by_video: raise Exception("No clips extracted")
 
-        # Initialiser avant assemblage
         voice_path = None
         music_path = None
         cut_points = []
 
-        # 2. ASSEMBLER — rotation intelligente, jamais 2 clips identiques consécutifs
+        # 2. ASSEMBLER — ── FIX ANTI-BOUCLE ──
         interleaved = interleave_clips(clips_by_video)
         needed = math.ceil(duration / 3.0)
         all_clips = list(interleaved)
-
-        # Mélanger les clips de chaque vidéo séparément pour varier
         random.shuffle(all_clips)
 
-        # Construire la sélection en évitant les répétitions consécutives
+        total_available = len(all_clips)
+        # ── JAMAIS recycler les clips — chaque clip utilisé UNE SEULE FOIS ──
+        max_usable = min(needed, total_available)
+
         selected = []
         last_video = None
-        pool = list(all_clips)  # copie pour cycle
-        used_idx = 0
+        remaining = list(all_clips)  # pool SANS remise
 
-        for _ in range(needed):
-            # Chercher un clip d'une vidéo différente de la précédente
+        for _ in range(max_usable):
+            if not remaining:
+                break
             found = False
-            for attempt in range(len(pool)):
-                idx = (used_idx + attempt) % len(pool)
-                clip = pool[idx]
+            for i, clip in enumerate(remaining):
                 clip_video = os.path.basename(clip).split('_c')[0]
                 if clip_video != last_video or len(clips_by_video) == 1:
                     selected.append(clip)
                     last_video = clip_video
-                    used_idx = (idx + 1) % len(pool)
+                    remaining.pop(i)
                     found = True
                     break
-            if not found:
-                # Fallback si impossible d'alterner
-                selected.append(pool[used_idx % len(pool)])
-                used_idx = (used_idx + 1) % len(pool)
+            if not found and remaining:
+                selected.append(remaining.pop(0))
+
+        if len(selected) < needed:
+            print(f"  INFO: seulement {len(selected)} clips disponibles pour {duration}s — pas de répétition")
 
         videos_used = len(set(os.path.basename(s).split('_c')[0] for s in selected))
-        print(f"  {len(selected)} clips de {videos_used}/{len(clips_by_video)} vidéos — alternance OK")
+        print(f"  {len(selected)} clips de {videos_used}/{len(clips_by_video)} vidéos — alternance OK (sans répétition)")
 
-        # ── SYNCHRONISATION VOIX: recalculer durée de chaque clip selon les pauses ──
+        # Sync voix
         if voice_path and os.path.exists(voice_path):
             voice_dur_for_cuts = get_duration(voice_path)
             cut_points = detect_voice_cuts(voice_path, voice_dur_for_cuts)
-
-            # Calculer la durée de chaque segment entre les coupes
             seg_starts = [0.0] + cut_points
             seg_durations = []
             for j in range(len(selected)):
@@ -678,27 +550,19 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     seg_dur = round(cut_points[j] - seg_starts[j], 2)
                 else:
                     seg_dur = round(voice_dur_for_cuts - seg_starts[min(j, len(seg_starts)-1)], 2)
-                seg_dur = max(0.5, min(6.0, seg_dur))  # Entre 0.5s et 6s par clip
+                seg_dur = max(0.5, min(6.0, seg_dur))
                 seg_durations.append(seg_dur)
 
-            print(f"  Durées clips synchronisées: {[round(d,1) for d in seg_durations[:8]]}")
-
-            # Re-extraire chaque clip avec la durée exacte du segment
             synced_clips = []
             for idx, (clip_path, seg_dur) in enumerate(zip(selected, seg_durations)):
                 synced = f"{tmp}/synced_{idx:03d}.mp4"
                 r = subprocess.run([
-                    'ffmpeg', '-y', '-i', clip_path,
-                    '-t', str(seg_dur),
+                    'ffmpeg', '-y', '-i', clip_path, '-t', str(seg_dur),
                     '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
                     '-pix_fmt', 'yuv420p', '-r', '30', '-an', synced
                 ], capture_output=True)
-                if r.returncode == 0 and os.path.exists(synced):
-                    synced_clips.append(synced)
-                else:
-                    synced_clips.append(clip_path)  # fallback clip original
+                synced_clips.append(synced if r.returncode == 0 else clip_path)
             selected = synced_clips
-            print(f"  Clips re-découpés selon voix OK")
         else:
             print(f"  Pas de voix → clips durée standard 3s")
 
@@ -710,13 +574,12 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         res_asm = subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
-            '-pix_fmt', 'yuv420p', '-r', '30', '-vsync', 'cfr',
-            assembled
+            '-pix_fmt', 'yuv420p', '-r', '30', '-vsync', 'cfr', assembled
         ], capture_output=True, text=True)
         if res_asm.returncode != 0:
             raise Exception(f"Assemblage échoué: {res_asm.stderr[-200:]}")
         asm_dur = get_duration(assembled)
-        print(f"  assembled OK ({asm_dur:.1f}s synchronisé avec voix)")
+        print(f"  assembled OK ({asm_dur:.1f}s)")
 
         for clips in clips_by_video:
             for c in clips:
@@ -727,7 +590,6 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         import re as _re
         voiceover = _re.sub(r'^[#\s\*]*[^\n]{0,60}\n', '', voiceover).strip()
         voiceover = _re.sub(r'[#\*`]', '', voiceover).strip()
-        voice_path = music_path = None
         if voice_url:
             try:
                 p = f"{tmp}/voice.mp3"; dl(voice_url, p); voice_path = p
@@ -749,16 +611,13 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         actual_duration = duration
         if voice_path:
             try:
-                voice_dur = get_duration(voice_path)
-                actual_duration = voice_dur
+                actual_duration = get_duration(voice_path)
                 print(f"  voice duration={actual_duration:.1f}s (target={duration}s)")
-            except Exception as e:
-                print(f"  get_duration error: {e}")
+            except: pass
 
         if n == 1:
             cmd += ['-an']
         elif n == 2 and voice_path:
-            # Voix propre: pas de filtre audio, juste resampling pour stabilité
             cmd += [
                 '-filter_complex', '[1:a]aresample=44100,asetpts=PTS-STARTPTS[aout]',
                 '-map', '0:v', '-map', '[aout]',
@@ -769,7 +628,6 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     f'[1:a]aresample=44100,volume=0.10,atrim=0:{actual_duration},asetpts=PTS-STARTPTS[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k', '-ar', '44100']
         else:
-            # Voix + musique
             cmd += ['-filter_complex',
                     f'[1:a]aresample=44100,asetpts=PTS-STARTPTS[v];'
                     f'[2:a]aresample=44100,volume=0.08,atrim=0:{actual_duration},asetpts=PTS-STARTPTS[m];'
@@ -786,24 +644,19 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"  mix OK ({size_mb:.1f}MB)")
-        clean_output = output  # Sauvegarder référence vidéo propre avant VFX/watermark
+        clean_output = output
+
         try: os.remove(assembled)
         except: pass
 
-        # 5. VFX Pro — aux coupures de plan synchronisées
+        # 5. VFX
         if vfx:
-            print("  Applying VFX Pro (transitions aux coupures)...")
-            # Récupérer les coupures détectées (si sync voix activée)
-            vfx_cuts = cut_points if 'cut_points' in dir() and cut_points else None
-            vfx_output = apply_vfx(output, tmp, actual_duration, cut_points=vfx_cuts)
+            vfx_output = apply_vfx(output, tmp, actual_duration, cut_points=cut_points if cut_points else None)
             if vfx_output != output:
                 output = vfx_output
-                print("  VFX Pro OK")
 
-        # 6. SUBMAGIC captions
+        # 6. SUBMAGIC
         submagic_url = submagic_process(output, pid, style, use_vfx_transitions=vfx) if with_captions else None
-        if not with_captions:
-            print("  Captions skipped by user")
 
         video_final = output
         if submagic_url:
@@ -812,25 +665,18 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 sm_local = f"{tmp}/submagic_out.mp4"
                 dl(submagic_url, sm_local)
                 sm_size = os.path.getsize(sm_local) if os.path.exists(sm_local) else 0
-                print(f"  Submagic size: {sm_size/1024/1024:.1f}MB ({sm_size} bytes)")
-                
+                print(f"  Submagic size: {sm_size/1024/1024:.1f}MB")
                 if sm_size > 500_000:
-                    # Vérifier que la vidéo est lisible avec ffprobe
-                    probe = subprocess.run(
-                        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', sm_local],
-                        capture_output=True, text=True, timeout=15
-                    )
+                    probe = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', sm_local], capture_output=True, text=True, timeout=15)
                     if probe.returncode == 0 and 'video' in probe.stdout:
                         video_final = sm_local
-                        print("  Submagic OK et valide")
+                        print("  Submagic OK")
                     else:
-                        print(f"  Submagic corrompu (ffprobe failed) — fallback clean_output")
                         video_final = clean_output
                 else:
-                    print(f"  Submagic trop petit ({sm_size} bytes) — fallback clean_output")
                     video_final = clean_output
             except Exception as e:
-                print(f"  Submagic error: {e} — fallback clean_output")
+                print(f"  Submagic error: {e}")
                 video_final = clean_output
 
         # 7. FILIGRANE
@@ -838,50 +684,38 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         if is_free:
             video_final = add_watermark(video_final, tmp, duration, is_free)
 
-        # 8. UPLOAD SUPABASE avec vérification taille + compression + retry
+        # 8. UPLOAD
         filename = f"renders/{pid}/ad_machine_{pid[:8]}.mp4"
         print(f"  Uploading to Supabase...")
         with open(video_final, 'rb') as f: video_bytes = f.read()
-        
         file_size_mb = len(video_bytes) / 1024 / 1024
-        print(f"  File size: {file_size_mb:.1f}MB ({len(video_bytes)} bytes)")
-        
-        # Si fichier trop petit (<500KB) → fallback sur vidéo propre
+        print(f"  File size: {file_size_mb:.1f}MB")
+
         if len(video_bytes) < 500_000:
             print(f"  WARN: fichier trop petit — fallback clean_output")
             try:
                 with open(clean_output, 'rb') as f: video_bytes = f.read()
                 file_size_mb = len(video_bytes) / 1024 / 1024
-                print(f"  Fallback OK: {file_size_mb:.1f}MB")
-            except Exception as fe:
-                print(f"  Fallback error: {fe}")
+            except: pass
 
-        # Si fichier > 45MB → compresser pour rester sous limite Supabase 50MB
         if file_size_mb > 45:
-            print(f"  File trop grand ({file_size_mb:.1f}MB) → compression...")
+            print(f"  Compression ({file_size_mb:.1f}MB → max 40MB)...")
             compressed = f"{tmp}/compressed.mp4"
-            # Calculer bitrate cible pour 40MB max
-            target_mb = 40
             vid_dur = get_duration(video_final) if os.path.exists(video_final) else actual_duration
-            target_bitrate = int((target_mb * 8 * 1024) / vid_dur)  # kbps
-            target_bitrate = max(800, min(target_bitrate, 2500))  # entre 800 et 2500 kbps
-            print(f"  Target bitrate: {target_bitrate}kbps pour {vid_dur:.1f}s")
+            target_bitrate = max(800, min(int((40 * 8 * 1024) / vid_dur), 2500))
+            print(f"  Target bitrate: {target_bitrate}kbps")
             res_comp = subprocess.run([
                 'ffmpeg', '-y', '-i', video_final,
                 '-c:v', 'libx264', '-b:v', f'{target_bitrate}k',
                 '-preset', 'fast', '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac', '-b:a', '128k',
-                '-movflags', '+faststart', compressed
+                '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', compressed
             ], capture_output=True, text=True, timeout=300)
             if res_comp.returncode == 0 and os.path.exists(compressed):
                 with open(compressed, 'rb') as f: video_bytes = f.read()
                 file_size_mb = len(video_bytes) / 1024 / 1024
                 print(f"  Compressed: {file_size_mb:.1f}MB")
-            else:
-                print(f"  Compression failed: {res_comp.stderr[-100:]}")
-        
+
         upload_ok = False
-        last_upload_error = ''
         for attempt in range(3):
             try:
                 sb.upload('videos', filename, video_bytes)
@@ -889,53 +723,32 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 print(f"  Upload OK attempt {attempt+1} ({file_size_mb:.1f}MB)")
                 break
             except Exception as e:
-                last_upload_error = str(e)
                 print(f"  Upload attempt {attempt+1} failed: {e}")
-                if attempt < 2:
-                    time.sleep(5)
-        
+                if attempt < 2: time.sleep(5)
+
         if not upload_ok:
-            # Dernier recours: essayer avec un nom de fichier différent
             try:
-                filename2 = f"renders/{pid}/ad_{int(time.time())}.mp4"
-                print(f"  Retry with new filename: {filename2}")
-                sb.upload('videos', filename2, video_bytes)
-                filename = filename2
+                filename = f"renders/{pid}/ad_{int(time.time())}.mp4"
+                sb.upload('videos', filename, video_bytes)
                 upload_ok = True
-                print(f"  Upload OK with new filename")
             except Exception as e:
-                print(f"  Final upload attempt failed: {e}")
-                raise Exception(f"Upload Supabase échoué: {last_upload_error}")
-        
+                raise Exception(f"Upload Supabase échoué: {e}")
+
         final_url = sb.public_url('videos', filename)
         print(f"  URL: {final_url[:80]}")
-
-        # Vérifier que l'URL est accessible
         try:
             check = requests.head(final_url, timeout=10)
             print(f"  URL check: {check.status_code}")
-        except Exception as e:
-            print(f"  URL check error (non bloquant): {e}")
+        except: pass
 
         sb.update_video(pid, {'video_url': final_url})
         sb.update_project(pid, {'status': 'done'})
         print(f"  Supabase updated: video_url + status=done")
 
-        # 9. NOTIFICATION EMAIL — dans un thread séparé pour ne pas bloquer
         if user_id and sb_url and sb_key:
             def send_notif():
-                try:
-                    notify_user_video_ready(user_id, final_url, pid, sb_url, sb_key)
-                except Exception as e:
-                    print(f"  Notification error: {e}")
-                    try:
-                        requests.post(f"{app_url}/api/send-notification", json={
-                            'type': 'video_ready',
-                            'userId': user_id,
-                            'videoUrl': final_url,
-                            'projectId': pid,
-                        }, timeout=15)
-                    except: pass
+                try: notify_user_video_ready(user_id, final_url, pid, sb_url, sb_key)
+                except: pass
             threading.Thread(target=send_notif, daemon=True).start()
 
         return final_url
