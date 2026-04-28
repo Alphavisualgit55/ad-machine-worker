@@ -38,6 +38,35 @@ class SB:
         try: requests.patch(f"{self.url}/rest/v1/projects?id=eq.{pid}", headers=self.h, json=data, timeout=30)
         except: pass
 
+    def refund_credit(self, pid, vfx=False):
+        """Rembourse 1 ou 1.5 crédit si la vidéo échoue"""
+        try:
+            credit_cost = 1.5 if vfx else 1.0
+            # Récupérer user_id du projet
+            r = requests.get(f"{self.url}/rest/v1/projects?id=eq.{pid}&select=user_id", headers=self.h, timeout=15)
+            if not r.ok: return
+            data = r.json()
+            if not data: return
+            user_id = data[0].get('user_id')
+            if not user_id: return
+            # Récupérer crédits actuels
+            r2 = requests.get(f"{self.url}/rest/v1/subscriptions?user_id=eq.{user_id}&select=credits_remaining", headers=self.h, timeout=15)
+            if not r2.ok: return
+            subs = r2.json()
+            if not subs: return
+            current = float(subs[0].get('credits_remaining', 0))
+            new_credits = round(current + credit_cost, 1)
+            # Rembourser
+            requests.patch(
+                f"{self.url}/rest/v1/subscriptions?user_id=eq.{user_id}",
+                headers=self.h,
+                json={'credits_remaining': new_credits},
+                timeout=15
+            )
+            print(f"  [REFUND] {credit_cost} crédit remboursé → user {user_id[:8]} ({current} → {new_credits})")
+        except Exception as e:
+            print(f"  [REFUND ERROR] {e}")
+
     def update_video(self, pid, data):
         try: requests.patch(f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.true", headers=self.h, json=data, timeout=30)
         except: pass
@@ -90,7 +119,10 @@ def render():
             print(f"[{pid}] ERROR: {e}")
             try:
                 sb.update_project(pid, {'status': 'failed'})
-            except: pass
+                # Remboursement automatique du crédit
+                sb.refund_credit(pid, vfx=vfx)
+            except Exception as re:
+                print(f"[{pid}] REFUND ERROR: {re}")
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify({'success': True})
