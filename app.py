@@ -27,7 +27,13 @@ def index():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'ffmpeg': 'ok'})
+    return jsonify({
+        'status': 'ok',
+        'ffmpeg': 'ok',
+        'active_renders': active_renders,
+        'max_parallel': MAX_PARALLEL,
+        'slots_free': MAX_PARALLEL - active_renders,
+    })
 
 class SB:
     def __init__(self, url, key):
@@ -88,6 +94,13 @@ class SB:
         return f"{self.url}/storage/v1/object/public/{bucket}/{path}"
 
 
+# ── File d'attente avec parallélisme limité ──────────────────────────────────
+import queue as _queue
+MAX_PARALLEL = 3  # Max 3 rendus en parallèle (XLarge = 8 vCPU)
+render_semaphore = threading.Semaphore(MAX_PARALLEL)
+active_renders = 0
+active_renders_lock = threading.Lock()
+
 @app.route('/render', methods=['POST'])
 def render():
     data = request.json
@@ -110,22 +123,30 @@ def render():
         return jsonify({'error': 'Donnees manquantes'}), 400
 
     def run():
-        sb = SB(sb_url, sb_key)
-        try:
-            url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb, sb_url=sb_url, sb_key=sb_key)
-            print(f"[{pid}] DONE")
-        except Exception as e:
-            traceback.print_exc()
-            print(f"[{pid}] ERROR: {e}")
+        global active_renders
+        with render_semaphore:  # Max MAX_PARALLEL en simultané
+            with active_renders_lock:
+                active_renders += 1
+            print(f"[{pid[:8]}] SLOT acquis — {active_renders}/{MAX_PARALLEL} actifs")
+            sb = SB(sb_url, sb_key)
             try:
-                sb.update_project(pid, {'status': 'failed'})
-                # Remboursement automatique du crédit
-                sb.refund_credit(pid, vfx=vfx)
-            except Exception as re:
-                print(f"[{pid}] REFUND ERROR: {re}")
+                url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb, sb_url=sb_url, sb_key=sb_key)
+                print(f"[{pid}] DONE")
+            except Exception as e:
+                traceback.print_exc()
+                print(f"[{pid}] ERROR: {e}")
+                try:
+                    sb.update_project(pid, {'status': 'failed'})
+                    sb.refund_credit(pid, vfx=vfx)
+                except Exception as re:
+                    print(f"[{pid}] REFUND ERROR: {re}")
+            finally:
+                with active_renders_lock:
+                    active_renders -= 1
+                print(f"[{pid[:8]}] SLOT libéré — {active_renders}/{MAX_PARALLEL} actifs")
 
     threading.Thread(target=run, daemon=True).start()
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'queued': True})
 
 
 def dl(url, path):
