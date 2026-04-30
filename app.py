@@ -218,7 +218,7 @@ def add_watermark(video_path, tmp, duration, is_free):
             '[1:v]scale=1080:-1,format=rgba,colorchannelmixer=aa=0.85[wm];'
             '[0:v][wm]overlay=(W-w)/2:(H-h)/2:format=auto[vout]',
             '-map', '[vout]', '-map', '0:a?',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
             '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
             '-movflags', '+faststart', '-t', str(duration), output
         ], capture_output=True, text=True, timeout=300)
@@ -233,7 +233,7 @@ def add_watermark(video_path, tmp, duration, is_free):
                 "x=(w-text_w)/2:y=(h-text_h)/2+65:"
                 "shadowcolor=black@0.4:shadowx=2:shadowy=2"
             ),
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
             '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
             '-movflags', '+faststart', '-t', str(duration), output
         ], capture_output=True, text=True, timeout=300)
@@ -536,7 +536,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     r = subprocess.run([
                         'ffmpeg', '-y', '-ss', str(start), '-i', src, '-t', str(cd),
                         '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30',
-                        '-r', '30', '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+                        '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
                         '-pix_fmt', 'yuv420p', '-avoid_negative_ts', 'make_zero', '-an', out
                     ], capture_output=True)
                     if r.returncode == 0:
@@ -611,7 +611,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 synced = f"{tmp}/synced_{idx:03d}.mp4"
                 r = subprocess.run([
                     'ffmpeg', '-y', '-i', clip_path, '-t', str(seg_dur),
-                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
                     '-pix_fmt', 'yuv420p', '-r', '30', '-an', synced
                 ], capture_output=True)
                 synced_clips.append(synced if r.returncode == 0 else clip_path)
@@ -626,7 +626,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         assembled = f"{tmp}/assembled.mp4"
         res_asm = subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
             '-pix_fmt', 'yuv420p', '-r', '30', '-vsync', 'cfr', assembled
         ], capture_output=True, text=True)
         if res_asm.returncode != 0:
@@ -687,7 +687,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                     f'[v][m]amix=inputs=2:duration=first:normalize=0[a]',
                     '-map', '0:v', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k', '-ar', '44100']
 
-        cmd += ['-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+        cmd += ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
                 '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
                 '-r', '30', '-t', str(actual_duration), output]
 
@@ -702,11 +702,28 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         try: os.remove(assembled)
         except: pass
 
-        # 5. VFX
+        # 5. VFX — avec timeout et fallback garanti
         if vfx:
-            vfx_output = apply_vfx(output, tmp, actual_duration, cut_points=cut_points if cut_points else None)
-            if vfx_output != output:
-                output = vfx_output
+            try:
+                print(f"  Applying VFX Pro...")
+                import signal as _signal
+                def _timeout_handler(signum, frame):
+                    raise Exception("VFX timeout après 120s")
+                # Timeout 120s pour VFX
+                old_handler = _signal.signal(_signal.SIGALRM, _timeout_handler)
+                _signal.alarm(120)
+                try:
+                    vfx_output = apply_vfx(output, tmp, actual_duration, cut_points=cut_points if cut_points else None)
+                    if vfx_output != output and os.path.exists(vfx_output) and os.path.getsize(vfx_output) > 100000:
+                        output = vfx_output
+                        print("  VFX OK")
+                    else:
+                        print("  VFX skipped (fallback vidéo propre)")
+                finally:
+                    _signal.alarm(0)
+                    _signal.signal(_signal.SIGALRM, old_handler)
+            except Exception as vfx_err:
+                print(f"  VFX ERROR (non bloquant): {vfx_err} → on continue sans VFX")
 
         # 6. SUBMAGIC
         submagic_url = submagic_process(output, pid, style, use_vfx_transitions=vfx) if with_captions else None
@@ -760,7 +777,7 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
             res_comp = subprocess.run([
                 'ffmpeg', '-y', '-i', video_final,
                 '-c:v', 'libx264', '-b:v', f'{target_bitrate}k',
-                '-preset', 'fast', '-pix_fmt', 'yuv420p',
+                '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', compressed
             ], capture_output=True, text=True, timeout=300)
             if res_comp.returncode == 0 and os.path.exists(compressed):
