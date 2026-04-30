@@ -25,6 +25,47 @@ WATERMARK_B64 = ""
 def index():
     return jsonify({'name': 'Ad Machine Worker', 'status': 'running'})
 
+def cleanup_on_startup():
+    """Au démarrage, passer en failed les projets bloqués en processing"""
+    try:
+        sb_url = (os.environ.get('SUPABASE_URL') or 
+                  os.environ.get('NEXT_PUBLIC_SUPABASE_URL') or '')
+        sb_key = (os.environ.get('SUPABASE_KEY') or 
+                  os.environ.get('SUPABASE_SERVICE_ROLE_KEY') or 
+                  os.environ.get('SUPABASE_SERVICE_KEY') or '')
+        if not sb_url or not sb_key:
+            print('[STARTUP] SUPABASE_URL/KEY manquant — skip cleanup')
+            return
+        sb = SB(sb_url, sb_key)
+        # Projets processing depuis plus de 10 min = orphelins du restart précédent
+        import datetime
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(minutes=10)).isoformat()
+        r = requests.patch(
+            f"{sb_url}/rest/v1/projects?status=eq.processing&created_at=lt.{cutoff}",
+            headers=sb.h,
+            json={'status': 'failed'},
+            timeout=15
+        )
+        if r.ok:
+            print(f'[STARTUP] Cleanup projets orphelins: {r.status_code}')
+        # Rembourser les crédits
+        r2 = requests.get(
+            f"{sb_url}/rest/v1/projects?status=eq.failed&created_at=gt.{cutoff}&select=user_id",
+            headers=sb.h, timeout=15
+        )
+        if r2.ok:
+            user_ids = list(set(p['user_id'] for p in r2.json() if p.get('user_id')))
+            for uid in user_ids:
+                try:
+                    rs = requests.get(f"{sb_url}/rest/v1/subscriptions?user_id=eq.{uid}&select=credits_remaining", headers=sb.h, timeout=10)
+                    if rs.ok and rs.json():
+                        current = rs.json()[0].get('credits_remaining', 0)
+                        requests.patch(f"{sb_url}/rest/v1/subscriptions?user_id=eq.{uid}", headers=sb.h, json={'credits_remaining': current + 1}, timeout=10)
+                except: pass
+            print(f'[STARTUP] Crédits remboursés pour {len(user_ids)} users')
+    except Exception as e:
+        print(f'[STARTUP] Cleanup error: {e}')
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
@@ -830,4 +871,6 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
+    # Cleanup au démarrage dans un thread pour ne pas bloquer
+    threading.Thread(target=cleanup_on_startup, daemon=True).start()
     app.run(host='0.0.0.0', port=port, debug=False)
