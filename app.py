@@ -132,6 +132,10 @@ def render():
             try:
                 url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb, sb_url=sb_url, sb_key=sb_key)
                 print(f"[{pid}] DONE")
+                try:
+                    sb.delete_broll(pid)
+                except Exception as ce:
+                    print(f"[{pid}] CLEANUP ERROR: {ce}")
             except Exception as e:
                 traceback.print_exc()
                 print(f"[{pid}] ERROR: {e}")
