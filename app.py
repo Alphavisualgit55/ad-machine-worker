@@ -134,6 +134,31 @@ class SB:
     def public_url(self, bucket, path):
         return f"{self.url}/storage/v1/object/public/{bucket}/{path}"
 
+    def delete_broll(self, pid):
+        try:
+            r = requests.get(
+                f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.false&select=video_url",
+                headers=self.h, timeout=15
+            )
+            if not r.ok: return
+            videos = r.json()
+            deleted = 0
+            for v in videos:
+                url = v.get('video_url', '')
+                if not url or '/storage/v1/object/public/videos/' not in url: continue
+                try:
+                    path = url.split('/storage/v1/object/public/videos/')[1]
+                    h2 = {'apikey': self.h['apikey'], 'Authorization': self.h['Authorization']}
+                    rd = requests.delete(
+                        f"{self.url}/storage/v1/object/videos/{path}",
+                        headers=h2, timeout=15
+                    )
+                    if rd.ok: deleted += 1
+                except: pass
+            print(f"  [CLEANUP] {deleted}/{len(videos)} b-roll supprimés")
+        except Exception as e:
+            print(f"  [CLEANUP] Erreur: {e}")
+
 
 # ── File d'attente avec parallélisme limité ──────────────────────────────────
 import queue as _queue
@@ -210,7 +235,11 @@ def dl(url, path):
 
 def get_duration(path):
     r = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path], capture_output=True, text=True)
-    return float(json.loads(r.stdout)['format']['duration'])
+    data = json.loads(r.stdout)
+    dur = data.get('format', {}).get('duration')
+    if dur is None:
+        raise Exception(f"Pas de durée dans ffprobe pour {path}")
+    return float(dur)
 
 def detect_voice_cuts(voice_path, total_duration):
     try:
