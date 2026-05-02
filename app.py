@@ -168,43 +168,6 @@ active_renders = 0
 active_renders_lock = threading.Lock()
 
 
-
-
-    try:
-        import re as _re
-        clean = _re.sub(r'^[#\s]*(SCRIPT|VOICEOVER)[^\n]*\n', '', text, flags=_re.IGNORECASE).strip()
-        r = requests.post(
-            f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}',
-            headers={
-                'Accept': 'audio/mpeg',
-                'Content-Type': 'application/json',
-                'xi-api-key': api_key,
-            },
-            json={
-                'text': clean,
-                'model_id': 'eleven_multilingual_v2',
-                'voice_settings': {'stability': 0.40, 'similarity_boost': 0.85, 'style': 0.80, 'use_speaker_boost': True},
-            },
-            timeout=60
-        )
-        if not r.ok:
-            print(f"  [VOICE] HTTP {r.status_code}")
-            return None
-        # Upload sur Supabase
-        h_up = {'apikey': sb_key, 'Authorization': f'Bearer {sb_key}', 'Content-Type': 'audio/mpeg', 'x-upsert': 'true'}
-        path = f"voices/{pid}/voiceover.mp3"
-        ru = requests.post(f"{sb_url}/storage/v1/object/videos/{path}", headers=h_up, data=r.content, timeout=120)
-        if ru.ok:
-            voice_url = f"{sb_url}/storage/v1/object/public/videos/{path}"
-            # Update project
-            h_db = {'apikey': sb_key, 'Authorization': f'Bearer {sb_key}', 'Content-Type': 'application/json'}
-            requests.patch(f"{sb_url}/rest/v1/projects?id=eq.{pid}", headers=h_db, json={'voice_url': voice_url}, timeout=15)
-            return voice_url
-    except Exception as e:
-        print(f"  [VOICE ERROR] {e}")
-    return None
-
-
 @app.route('/render', methods=['POST'])
 def render():
     data = request.json
