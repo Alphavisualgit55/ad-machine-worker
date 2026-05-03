@@ -5,7 +5,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-SUBMAGIC_KEY = 'sk-b0e3311c51f0d1251a5e43cdb7086fb05fe4cec827a848ad47bd2905a3bb7643'
+SUBMAGIC_KEY = os.environ.get('SUBMAGIC_KEY', 'sk-b0e3311c51f0d1251a5e43cdb7086fb05fe4cec827a848ad47bd2905a3bb7643')
 SUBMAGIC_URL = 'https://api.submagic.co/v1'
 
 VFX_OVERLAYS = [
@@ -20,7 +20,7 @@ VFX_OVERLAYS = [
 WATERMARK_URL = 'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/watermark/watermark.png'
 BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
-MAX_PARALLEL = 2
+MAX_PARALLEL = 3
 render_semaphore = threading.Semaphore(MAX_PARALLEL)
 active_renders = 0
 active_renders_lock = threading.Lock()
@@ -154,8 +154,13 @@ def dl(url, path):
 
 
 def get_duration(path):
-    r = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path], capture_output=True, text=True)
-    data = json.loads(r.stdout)
+    r = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path], capture_output=True, text=True, timeout=30)
+    if not r.stdout or not r.stdout.strip():
+        raise Exception(f"ffprobe vide pour {path}")
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        raise Exception(f"ffprobe JSON invalide pour {path}")
     dur = data.get('format', {}).get('duration')
     if dur is None:
         raise Exception(f"Pas de durée: {path}")
@@ -328,7 +333,11 @@ def apply_vfx(video_path, tmp, duration, cut_points=None):
 
 
 def submagic_process(video_path, pid, template, use_vfx_transitions=False):
-    headers_sm = {'x-api-key': SUBMAGIC_KEY}
+    sm_key = SUBMAGIC_KEY
+    if not sm_key:
+        print("  [SM] Clé manquante — skip")
+        return None
+    headers_sm = {'x-api-key': sm_key}
     valid_templates = [
         'Hormozi 2','Hormozi 1','Hormozi 3','Hormozi 4','Hormozi 5',
         'Beast','Sara','Karl','Ella','Matt','Jess','Nick','Laura',
@@ -350,19 +359,33 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
         'removeSilencePace': 'fast' if use_vfx_transitions else 'natural',
     }
 
-    try:
-        with open(video_path, 'rb') as f:
-            video_bytes = f.read()
-        print(f"  [SM] Uploading {len(video_bytes)/1024/1024:.1f}MB...")
-        resp = requests.post(
-            f'{SUBMAGIC_URL}/projects/upload',
-            headers=headers_sm,
-            files={'file': ('video.mp4', video_bytes, 'video/mp4')},
-            data=form_data,
-            timeout=300
-        )
-    except Exception as e:
-        print(f"  [SM] Upload exception: {e}")
+    # Timeout global Submagic = 8 minutes
+    sm_deadline = time.time() + 480
+
+    for sm_attempt in range(2):
+        try:
+            with open(video_path, 'rb') as f:
+                video_bytes = f.read()
+            print(f"  [SM] Uploading {len(video_bytes)/1024/1024:.1f}MB... (attempt {sm_attempt+1})")
+            resp = requests.post(
+                f'{SUBMAGIC_URL}/projects/upload',
+                headers=headers_sm,
+                files={'file': ('video.mp4', video_bytes, 'video/mp4')},
+                data=form_data,
+                timeout=300
+            )
+            if resp.ok:
+                break
+            print(f"  [SM] Upload HTTP {resp.status_code} — retry")
+            if sm_attempt == 0:
+                time.sleep(5)
+        except Exception as e:
+            print(f"  [SM] Upload exception: {e}")
+            if sm_attempt == 0:
+                time.sleep(5)
+                continue
+            return None
+    else:
         return None
 
     if not resp.ok:
@@ -378,6 +401,9 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
         return None
 
     for i in range(40):
+        if time.time() > sm_deadline:
+            print("  [SM] Timeout global (8min) — skip captions")
+            return None
         time.sleep(5)
         try:
             r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
@@ -403,6 +429,9 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
         return None
 
     for i in range(60):
+        if time.time() > sm_deadline:
+            print("  [SM] Timeout global (8min) — skip captions")
+            return None
         time.sleep(5)
         try:
             r = requests.get(f'{SUBMAGIC_URL}/projects/{sm_id}', headers=headers_sm, timeout=15)
@@ -417,6 +446,7 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
             if status == 'failed': return None
         except: continue
 
+    print("  [SM] Timeout polling — skip captions")
     return None
 
 
@@ -816,6 +846,17 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
         return final_url
 
+
+@app.route('/status', methods=['GET'])
+def status():
+    """Endpoint de monitoring pour load balancer"""
+    return jsonify({
+        'status': 'ok',
+        'active_renders': active_renders,
+        'slots_free': MAX_PARALLEL - active_renders,
+        'accepting': active_renders < MAX_PARALLEL,
+        'max_parallel': MAX_PARALLEL,
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
