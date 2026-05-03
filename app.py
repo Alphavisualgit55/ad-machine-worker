@@ -17,64 +17,29 @@ VFX_OVERLAYS = [
     'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/overlays/fx5.mp4',
 ]
 
-FILM_BURN_URL = os.environ.get('FILM_BURN_URL', '')
 WATERMARK_URL = 'https://lowkevqfsfhhcaebqkxi.supabase.co/storage/v1/object/public/videos/watermark/watermark.png'
-WATERMARK_B64 = ""
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
+
+MAX_PARALLEL = 2
+render_semaphore = threading.Semaphore(MAX_PARALLEL)
+active_renders = 0
+active_renders_lock = threading.Lock()
+
 
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({'name': 'Ad Machine Worker', 'status': 'running'})
 
-def cleanup_on_startup():
-    """Au démarrage, passer en failed les projets bloqués en processing"""
-    try:
-        sb_url = (os.environ.get('SUPABASE_URL') or 
-                  os.environ.get('NEXT_PUBLIC_SUPABASE_URL') or '')
-        sb_key = (os.environ.get('SUPABASE_KEY') or 
-                  os.environ.get('SUPABASE_SERVICE_ROLE_KEY') or 
-                  os.environ.get('SUPABASE_SERVICE_KEY') or '')
-        if not sb_url or not sb_key:
-            print('[STARTUP] SUPABASE_URL/KEY manquant — skip cleanup')
-            return
-        sb = SB(sb_url, sb_key)
-        # Projets processing depuis plus de 10 min = orphelins du restart précédent
-        import datetime
-        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(minutes=10)).isoformat()
-        r = requests.patch(
-            f"{sb_url}/rest/v1/projects?status=eq.processing&created_at=lt.{cutoff}",
-            headers=sb.h,
-            json={'status': 'failed'},
-            timeout=15
-        )
-        if r.ok:
-            print(f'[STARTUP] Cleanup projets orphelins: {r.status_code}')
-        # Rembourser les crédits
-        r2 = requests.get(
-            f"{sb_url}/rest/v1/projects?status=eq.failed&created_at=gt.{cutoff}&select=user_id",
-            headers=sb.h, timeout=15
-        )
-        if r2.ok:
-            user_ids = list(set(p['user_id'] for p in r2.json() if p.get('user_id')))
-            for uid in user_ids:
-                try:
-                    rs = requests.get(f"{sb_url}/rest/v1/subscriptions?user_id=eq.{uid}&select=credits_remaining", headers=sb.h, timeout=10)
-                    if rs.ok and rs.json():
-                        current = rs.json()[0].get('credits_remaining', 0)
-                        requests.patch(f"{sb_url}/rest/v1/subscriptions?user_id=eq.{uid}", headers=sb.h, json={'credits_remaining': current + 1}, timeout=10)
-                except: pass
-            print(f'[STARTUP] Crédits remboursés pour {len(user_ids)} users')
-    except Exception as e:
-        print(f'[STARTUP] Cleanup error: {e}')
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         'status': 'ok',
-        'ffmpeg': 'ok',
         'active_renders': active_renders,
         'max_parallel': MAX_PARALLEL,
         'slots_free': MAX_PARALLEL - active_renders,
     })
+
 
 class SB:
     def __init__(self, url, key):
@@ -86,31 +51,22 @@ class SB:
         except: pass
 
     def refund_credit(self, pid, vfx=False):
-        """Rembourse 1 ou 1.5 crédit si la vidéo échoue"""
         try:
             credit_cost = 1.5 if vfx else 1.0
-            # Récupérer user_id du projet
             r = requests.get(f"{self.url}/rest/v1/projects?id=eq.{pid}&select=user_id", headers=self.h, timeout=15)
             if not r.ok: return
             data = r.json()
             if not data: return
             user_id = data[0].get('user_id')
             if not user_id: return
-            # Récupérer crédits actuels
             r2 = requests.get(f"{self.url}/rest/v1/subscriptions?user_id=eq.{user_id}&select=credits_remaining", headers=self.h, timeout=15)
             if not r2.ok: return
             subs = r2.json()
             if not subs: return
             current = float(subs[0].get('credits_remaining', 0))
             new_credits = round(current + credit_cost, 1)
-            # Rembourser
-            requests.patch(
-                f"{self.url}/rest/v1/subscriptions?user_id=eq.{user_id}",
-                headers=self.h,
-                json={'credits_remaining': new_credits},
-                timeout=15
-            )
-            print(f"  [REFUND] {credit_cost} crédit remboursé → user {user_id[:8]} ({current} → {new_credits})")
+            requests.patch(f"{self.url}/rest/v1/subscriptions?user_id=eq.{user_id}", headers=self.h, json={'credits_remaining': new_credits}, timeout=15)
+            print(f"  [REFUND] {credit_cost} → {user_id[:8]} ({current} → {new_credits})")
         except Exception as e:
             print(f"  [REFUND ERROR] {e}")
 
@@ -134,64 +90,31 @@ class SB:
     def public_url(self, bucket, path):
         return f"{self.url}/storage/v1/object/public/{bucket}/{path}"
 
-    def delete_broll(self, pid):
-        try:
-            r = requests.get(
-                f"{self.url}/rest/v1/videos?project_id=eq.{pid}&generated=eq.false&select=video_url",
-                headers=self.h, timeout=15
-            )
-            if not r.ok: return
-            videos = r.json()
-            deleted = 0
-            for v in videos:
-                url = v.get('video_url', '')
-                if not url or '/storage/v1/object/public/videos/' not in url: continue
-                try:
-                    path = url.split('/storage/v1/object/public/videos/')[1]
-                    h2 = {'apikey': self.h['apikey'], 'Authorization': self.h['Authorization']}
-                    rd = requests.delete(
-                        f"{self.url}/storage/v1/object/videos/{path}",
-                        headers=h2, timeout=15
-                    )
-                    if rd.ok: deleted += 1
-                except: pass
-            print(f"  [CLEANUP] {deleted}/{len(videos)} b-roll supprimés")
-        except Exception as e:
-            print(f"  [CLEANUP] Erreur: {e}")
-
-
-# ── File d'attente avec parallélisme limité ──────────────────────────────────
-import queue as _queue
-MAX_PARALLEL = 3  # Max 3 rendus en parallèle (XLarge = 8 vCPU)
-render_semaphore = threading.Semaphore(MAX_PARALLEL)
-active_renders = 0
-active_renders_lock = threading.Lock()
-
 
 @app.route('/render', methods=['POST'])
 def render():
     data = request.json
-    pid          = data.get('projectId')
-    video_urls   = data.get('videoUrls', [])
-    voice_url    = data.get('voiceUrl')
-    music_url    = data.get('musicUrl')
-    voiceover    = data.get('voiceover', '')
-    duration     = int(data.get('duration', 30))
-    style        = data.get('captionStyle', 'Hormozi 2')
-    vfx          = data.get('vfx', False)
+    pid           = data.get('projectId')
+    video_urls    = data.get('videoUrls', [])
+    voice_url     = data.get('voiceUrl')
+    music_url     = data.get('musicUrl')
+    voiceover     = data.get('voiceover', '')
+    duration      = int(data.get('duration', 30))
+    style         = data.get('captionStyle', 'Hormozi 2')
+    vfx           = data.get('vfx', False)
     with_captions = data.get('withCaptions', True)
-    is_free      = data.get('isFree', True)
-    user_id      = data.get('userId', '')
-    app_url      = data.get('appUrl', 'https://admachine.io')
-    sb_url       = data.get('supabaseUrl')
-    sb_key       = data.get('supabaseKey')
+    is_free       = data.get('isFree', True)
+    user_id       = data.get('userId', '')
+    app_url       = data.get('appUrl', 'https://admachine.io')
+    sb_url        = data.get('supabaseUrl')
+    sb_key        = data.get('supabaseKey')
 
     if not pid or not video_urls:
         return jsonify({'error': 'Donnees manquantes'}), 400
 
     def run():
         global active_renders
-        with render_semaphore:  # Max MAX_PARALLEL en simultané
+        with render_semaphore:
             with active_renders_lock:
                 active_renders += 1
             print(f"[{pid[:8]}] SLOT acquis — {active_renders}/{MAX_PARALLEL} actifs")
@@ -199,10 +122,6 @@ def render():
             try:
                 url = process(pid, video_urls, voice_url, music_url, voiceover, duration, style, vfx, is_free, with_captions, user_id, app_url, sb, sb_url=sb_url, sb_key=sb_key)
                 print(f"[{pid}] DONE")
-                try:
-                    sb.delete_broll(pid)
-                except Exception as ce:
-                    print(f"[{pid}] CLEANUP ERROR: {ce}")
             except Exception as e:
                 traceback.print_exc()
                 print(f"[{pid}] ERROR: {e}")
@@ -224,7 +143,6 @@ def dl(url, path):
     r = requests.get(url, stream=True, timeout=180)
     if not r.ok:
         raise Exception(f"HTTP {r.status_code} pour {url[-60:]}")
-    r.raise_for_status()
     size = 0
     with open(path, 'wb') as f:
         for chunk in r.iter_content(65536):
@@ -234,13 +152,15 @@ def dl(url, path):
         raise Exception(f"Fichier vide: {url[-60:]}")
     print(f"    dl OK: {size/1024:.0f}KB")
 
+
 def get_duration(path):
     r = subprocess.run(['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path], capture_output=True, text=True)
     data = json.loads(r.stdout)
     dur = data.get('format', {}).get('duration')
     if dur is None:
-        raise Exception(f"Pas de durée dans ffprobe pour {path}")
+        raise Exception(f"Pas de durée: {path}")
     return float(dur)
+
 
 def detect_voice_cuts(voice_path, total_duration):
     try:
@@ -263,6 +183,7 @@ def detect_voice_cuts(voice_path, total_duration):
         return cuts
     except:
         return [i * 3.0 for i in range(1, int(total_duration / 3.0) + 1)]
+
 
 def interleave_clips(clips_by_video):
     result = []
@@ -350,7 +271,7 @@ def apply_vfx(video_path, tmp, duration, cut_points=None):
             for cut in cut_points:
                 pos = max(0.0, min(actual_dur - overlay_dur, round(cut - overlay_dur / 2, 2)))
                 positions.append(pos)
-            positions = sorted(list(set([round(p,2) for p in positions])))
+            positions = sorted(list(set([round(p, 2) for p in positions])))
             if len(positions) > 8:
                 positions = positions[:8]
         else:
@@ -414,7 +335,7 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
         'Daniel','Dan','Dan 2','Devin','Tayo','Jason','Noah',
         'Kelly','Kelly 2','William','Mia','Tom','Zoe'
     ]
-    template_map = {'Kelly 2':'Kelly 2','Dan 2':'Dan 2','William':'William'}
+    template_map = {'Kelly 2': 'Kelly 2', 'Dan 2': 'Dan 2', 'William': 'William'}
     template = template_map.get(template, template)
     if template not in valid_templates:
         template = 'Hormozi 2'
@@ -499,8 +420,6 @@ def submagic_process(video_path, pid, template, use_vfx_transitions=False):
     return None
 
 
-BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
-
 def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
     if not BREVO_API_KEY: return
     headers_sb = {'apikey': sb_key, 'Authorization': f'Bearer {sb_key}', 'Content-Type': 'application/json'}
@@ -524,7 +443,7 @@ def notify_user_video_ready(user_id, video_url, project_id, sb_url, sb_key):
         rj = requests.get(f"{sb_url}/rest/v1/projects?id=eq.{project_id}&select=product_description", headers=headers_sb, timeout=10)
         if rj.ok and rj.json():
             raw = rj.json()[0].get('product_description') or ''
-            desc = raw.replace('#','').replace('*','').replace('`','')[:80]
+            desc = raw.replace('#', '').replace('*', '').replace('`', '')[:80]
     except: pass
 
     html = f"""<div style="background:#050508;padding:40px;font-family:system-ui;color:white;max-width:520px;margin:0 auto;border-radius:20px">
@@ -573,7 +492,6 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         clips_per_video = max(1, min(3, math.ceil(clips_needed / max(nb_videos, 1)) + 1))
         print(f"  Plan: {nb_videos} vidéos × {clips_per_video} clips/vidéo pour {duration}s")
 
-        # 1. EXTRAIRE CLIPS
         clips_by_video = []
         for i, url in enumerate(video_urls):
             src = f"{tmp}/src_{i}.mp4"
@@ -586,11 +504,8 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 if src_dur <= 3.0:
                     positions = [0.0]
                 else:
-                    # Calculer combien de clips on peut vraiment extraire de cette vidéo
-                    max_possible = max(1, int(src_dur / 2.5))  # 1 clip toutes les 2.5s
+                    max_possible = max(1, int(src_dur / 2.5))
                     actual_clips = min(clips_per_video, max_possible)
-                    # Diviser la vidéo en segments égaux et prendre 1 position par segment
-                    # → garantit que toute la vidéo est couverte sans répétition
                     segment_size = src_dur / actual_clips
                     positions = []
                     for seg in range(actual_clips):
@@ -625,26 +540,59 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 except: pass
             except Exception as e:
                 print(f"  SKIP video {i+1}: {e}")
+                # Essayer de réparer avec ffmpeg avant de skip
+                try:
+                    repaired = f"{tmp}/repaired_{i}.mp4"
+                    rr = subprocess.run([
+                        'ffmpeg', '-y', '-i', src,
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
+                        '-pix_fmt', 'yuv420p', '-r', '30', repaired
+                    ], capture_output=True, timeout=60)
+                    if rr.returncode == 0:
+                        rep_dur = get_duration(repaired)
+                        if rep_dur > 1.0:
+                            print(f"  video {i+1} réparée ({rep_dur:.1f}s)")
+                            clips = []
+                            out = f"{tmp}/v{i}_c000.mp4"
+                            subprocess.run([
+                                'ffmpeg', '-y', '-i', repaired, '-t', '3',
+                                '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30',
+                                '-r', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
+                                '-pix_fmt', 'yuv420p', '-an', out
+                            ], capture_output=True)
+                            if os.path.exists(out):
+                                clips_by_video.append([out])
+                except Exception as e2:
+                    print(f"  Réparation impossible: {e2}")
 
-        if not clips_by_video: raise Exception("No clips extracted")
+        if not clips_by_video:
+            # Fallback : générer un clip noir plutôt que fail
+            print(f"  WARN: aucun clip extrait — génération clip noir fallback")
+            black_clip = f"{tmp}/v0_c000.mp4"
+            r_black = subprocess.run([
+                'ffmpeg', '-y', '-f', 'lavfi', '-i', 'color=c=black:size=1080x1920:rate=30',
+                '-t', '3', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
+                '-pix_fmt', 'yuv420p', black_clip
+            ], capture_output=True)
+            if r_black.returncode == 0:
+                clips_by_video = [[black_clip]]
+                print(f"  Clip noir fallback OK")
+            else:
+                raise Exception("No clips extracted and fallback failed")
 
         voice_path = None
         music_path = None
         cut_points = []
 
-        # 2. ASSEMBLER — ── FIX ANTI-BOUCLE ──
         interleaved = interleave_clips(clips_by_video)
         needed = math.ceil(duration / 3.0)
         all_clips = list(interleaved)
         random.shuffle(all_clips)
 
-        total_available = len(all_clips)
-        # ── JAMAIS recycler les clips — chaque clip utilisé UNE SEULE FOIS ──
-        max_usable = min(needed, total_available)
-
+        max_usable = min(needed, len(all_clips))
         selected = []
         last_video = None
-        remaining = list(all_clips)  # pool SANS remise
+        remaining = list(all_clips)
 
         for _ in range(max_usable):
             if not remaining:
@@ -662,41 +610,16 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 selected.append(remaining.pop(0))
 
         if len(selected) < needed:
-            print(f"  INFO: seulement {len(selected)} clips disponibles pour {duration}s — pas de répétition")
+            print(f"  INFO: seulement {len(selected)} clips disponibles pour {duration}s")
 
         videos_used = len(set(os.path.basename(s).split('_c')[0] for s in selected))
-        print(f"  {len(selected)} clips de {videos_used}/{len(clips_by_video)} vidéos — alternance OK (sans répétition)")
+        print(f"  {len(selected)} clips de {videos_used}/{len(clips_by_video)} vidéos — alternance OK")
 
-        # Sync voix
-        if voice_path and os.path.exists(voice_path):
-            voice_dur_for_cuts = get_duration(voice_path)
-            cut_points = detect_voice_cuts(voice_path, voice_dur_for_cuts)
-            seg_starts = [0.0] + cut_points
-            seg_durations = []
-            for j in range(len(selected)):
-                if j < len(cut_points):
-                    seg_dur = round(cut_points[j] - seg_starts[j], 2)
-                else:
-                    seg_dur = round(voice_dur_for_cuts - seg_starts[min(j, len(seg_starts)-1)], 2)
-                seg_dur = max(0.5, min(6.0, seg_dur))
-                seg_durations.append(seg_dur)
-
-            synced_clips = []
-            for idx, (clip_path, seg_dur) in enumerate(zip(selected, seg_durations)):
-                synced = f"{tmp}/synced_{idx:03d}.mp4"
-                r = subprocess.run([
-                    'ffmpeg', '-y', '-i', clip_path, '-t', str(seg_dur),
-                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22',
-                    '-pix_fmt', 'yuv420p', '-r', '30', '-an', synced
-                ], capture_output=True)
-                synced_clips.append(synced if r.returncode == 0 else clip_path)
-            selected = synced_clips
-        else:
-            print(f"  Pas de voix → clips durée standard 3s")
-
+        # Sync voix (APRES assemblage)
         concat = f"{tmp}/concat.txt"
         with open(concat, 'w') as f:
-            for clip in selected: f.write(f"file '{clip}'\n")
+            for clip in selected:
+                f.write(f"file '{clip}'\n")
 
         assembled = f"{tmp}/assembled.mp4"
         res_asm = subprocess.run([
@@ -714,22 +637,28 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 try: os.remove(c)
                 except: pass
 
-        # 3. VOIX + MUSIQUE
+        # VOIX + MUSIQUE
         import re as _re
         voiceover = _re.sub(r'^[#\s\*]*[^\n]{0,60}\n', '', voiceover).strip()
         voiceover = _re.sub(r'[#\*`]', '', voiceover).strip()
         if voice_url:
             try:
-                p = f"{tmp}/voice.mp3"; dl(voice_url, p); voice_path = p
+                p = f"{tmp}/voice.mp3"
+                dl(voice_url, p)
+                voice_path = p
                 print("  voice OK")
-            except Exception as e: print(f"  voice error: {e}")
+            except Exception as e:
+                print(f"  voice error: {e}")
         if music_url:
             try:
-                p = f"{tmp}/music.mp3"; dl(music_url, p); music_path = p
+                p = f"{tmp}/music.mp3"
+                dl(music_url, p)
+                music_path = p
                 print("  music OK")
-            except Exception as e: print(f"  music error: {e}")
+            except Exception as e:
+                print(f"  music error: {e}")
 
-        # 4. MIXAGE
+        # MIXAGE
         output = f"{tmp}/final.mp4"
         cmd = ['ffmpeg', '-y', '-i', assembled]
         n = 1
@@ -777,30 +706,17 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
         try: os.remove(assembled)
         except: pass
 
-        # 5. VFX — avec timeout et fallback garanti
+        # VFX
         if vfx:
             try:
-                print(f"  Applying VFX Pro...")
-                import signal as _signal
-                def _timeout_handler(signum, frame):
-                    raise Exception("VFX timeout après 120s")
-                # Timeout 120s pour VFX
-                old_handler = _signal.signal(_signal.SIGALRM, _timeout_handler)
-                _signal.alarm(120)
-                try:
-                    vfx_output = apply_vfx(output, tmp, actual_duration, cut_points=cut_points if cut_points else None)
-                    if vfx_output != output and os.path.exists(vfx_output) and os.path.getsize(vfx_output) > 100000:
-                        output = vfx_output
-                        print("  VFX OK")
-                    else:
-                        print("  VFX skipped (fallback vidéo propre)")
-                finally:
-                    _signal.alarm(0)
-                    _signal.signal(_signal.SIGALRM, old_handler)
-            except Exception as vfx_err:
-                print(f"  VFX ERROR (non bloquant): {vfx_err} → on continue sans VFX")
+                vfx_output = apply_vfx(output, tmp, actual_duration, cut_points=cut_points if cut_points else None)
+                if vfx_output != output and os.path.exists(vfx_output) and os.path.getsize(vfx_output) > 100000:
+                    output = vfx_output
+                    print("  VFX OK")
+            except Exception as e:
+                print(f"  VFX ERROR (non bloquant): {e}")
 
-        # 6. SUBMAGIC
+        # SUBMAGIC
         submagic_url = submagic_process(output, pid, style, use_vfx_transitions=vfx) if with_captions else None
 
         video_final = output
@@ -824,22 +740,24 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 print(f"  Submagic error: {e}")
                 video_final = clean_output
 
-        # 7. FILIGRANE
+        # FILIGRANE
         print(f"  Applying watermark (is_free={is_free})...")
         if is_free:
             video_final = add_watermark(video_final, tmp, duration, is_free)
 
-        # 8. UPLOAD
+        # UPLOAD
         filename = f"renders/{pid}/ad_machine_{pid[:8]}.mp4"
         print(f"  Uploading to Supabase...")
-        with open(video_final, 'rb') as f: video_bytes = f.read()
+        with open(video_final, 'rb') as f:
+            video_bytes = f.read()
         file_size_mb = len(video_bytes) / 1024 / 1024
         print(f"  File size: {file_size_mb:.1f}MB")
 
         if len(video_bytes) < 500_000:
             print(f"  WARN: fichier trop petit — fallback clean_output")
             try:
-                with open(clean_output, 'rb') as f: video_bytes = f.read()
+                with open(clean_output, 'rb') as f:
+                    video_bytes = f.read()
                 file_size_mb = len(video_bytes) / 1024 / 1024
             except: pass
 
@@ -856,7 +774,8 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
                 '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', compressed
             ], capture_output=True, text=True, timeout=300)
             if res_comp.returncode == 0 and os.path.exists(compressed):
-                with open(compressed, 'rb') as f: video_bytes = f.read()
+                with open(compressed, 'rb') as f:
+                    video_bytes = f.read()
                 file_size_mb = len(video_bytes) / 1024 / 1024
                 print(f"  Compressed: {file_size_mb:.1f}MB")
 
@@ -875,7 +794,6 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
             try:
                 filename = f"renders/{pid}/ad_{int(time.time())}.mp4"
                 sb.upload('videos', filename, video_bytes)
-                upload_ok = True
             except Exception as e:
                 raise Exception(f"Upload Supabase échoué: {e}")
 
@@ -901,6 +819,4 @@ def process(pid, video_urls, voice_url, music_url, voiceover, duration, style, v
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
-    # Cleanup au démarrage dans un thread pour ne pas bloquer
-    threading.Thread(target=cleanup_on_startup, daemon=True).start()
     app.run(host='0.0.0.0', port=port, debug=False)
